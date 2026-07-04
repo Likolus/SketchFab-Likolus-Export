@@ -37,7 +37,21 @@ Open the `.obj` in Maya or Blender → the MTL loads automatically, textures res
 - **Complete PBR map set** — albedo, normal, roughness, metallic, specular, emissive, opacity and AO are all classified and emitted with the right MTL keys.
 - **Relative texture paths** — textures live in a `textures/` subfolder and the MTL references them as `textures/...`, so paths resolve on any OS without editing.
 - **GLTF export** — alternative GLTF + `.bin` output (with PBR textures) for pipelines that prefer it.
-- **Progress UI** — per-stage progress bar (linking materials → fetching textures → writing OBJ/MTL → packaging) with live geometry/texture counts.
+- **Rig + animation export** — when enabled, the script also captures the skeleton (bones hierarchy with TRS), skin weights (JOINTS_0/WEIGHTS_0), inverse-bind matrices and keyframe animations, and writes them into the glTF. The rigged model opens in Maya/Blender with a working armature and playable animations. (OBJ cannot carry rig data — this requires glTF.)
+- **Progress UI** — per-stage progress bar (linking materials → fetching textures → writing OBJ/MTL → packaging) with live geometry/texture/bone/animation counts.
+
+### Rig & animation export
+
+Animated/rigged models need a skeleton (bones), skin weights (which vertices each bone influences), inverse-bind matrices, and keyframe animations. None of this can live in OBJ — OBJ is purely static geometry. The script therefore exports rig data through **glTF**, which has native `skins`, `joints`, `weights`, `inverseBindMatrices` and `animations` — all supported by Maya and Blender.
+
+To export a rigged model:
+
+1. Tick **Rig + Anim** in the panel. This forces the **GLTF** format (OBJ is disabled because it cannot carry rig data).
+2. Let the model fully load, and play/scrub the animation at least once so the viewer uploads the skeleton and animation tracks.
+3. Click **EXPORT & DOWNLOAD**. The script captures bones (with their local TRS and parent hierarchy), per-vertex joint indices + weights, inverse-bind matrices, and every animation track (per-bone translation/rotation/scale keyframes).
+4. The resulting `ModelName.gltf` + `ModelName.bin` open in Blender (`File → Import → glTF`) or Maya (`File → Import`) with a working armature and playable animations.
+
+> **Note on capture reliability:** Sketchfab's viewer is minified and does not expose a documented rig API. The script probes many possible internal property names for skin / joints / weights / skeleton / animations. On most rigged models this succeeds; if a particular model exposes skinning under unusual names, the Bones/Anims counters may stay 0 — in that case enable the browser console and look for `[LikolusExport]` lines to see what was probed.
 
 ### PBR map support
 
@@ -155,7 +169,21 @@ ModelName/
 - **Полный набор PBR-карт** — albedo, normal, roughness, metallic, specular, emissive, opacity и AO классифицируются и выводятся с нужными MTL-ключами.
 - **Относительные пути к текстурам** — текстуры лежат в подпапке `textures/`, а MTL ссылается на них как `textures/...`, поэтому пути работают на любой ОС без правок.
 - **Экспорт в GLTF** — альтернативный вывод GLTF + `.bin` (с PBR-текстурами) для пайплайнов, где это удобнее.
-- **Индикатор прогресса** — прогресс-бар по стадиям (связывание материалов → загрузка текстур → запись OBJ/MTL → упаковка) с живым счётчиком геометрий и текстур.
+- **Экспорт рига и анимации** — при включении скрипт дополнительно захватывает скелет (иерархию костей с TRS), скин-веса (`JOINTS_0`/`WEIGHTS_0`), обратные матрицы связывания (inverse-bind) и покадровые анимации и записывает их в glTF. Ригованная модель открывается в Maya/Blender с рабочей арматурой и воспроизводимыми анимациями. (OBJ не может нести данные рига — для этого нужен glTF.)
+- **Индикатор прогресса** — прогресс-бар по стадиям (связывание материалов → загрузка текстур → запись OBJ/MTL → упаковка) с живым счётчиком геометрий/текстур/костей/анимаций.
+
+### Экспорт рига и анимации
+
+Анимированные/ригованные модели требуют скелета (костей), скин-весов (какие вершины влияет на каждую кость), обратных матриц связывания и покадровых анимаций. Ничто из этого не может жить в OBJ — OBJ чисто статическая геометрия. Поэтому скрипт экспортирует данные рига через **glTF**, в котором есть нативные `skins`, `joints`, `weights`, `inverseBindMatrices` и `animations` — всё поддерживается Maya и Blender.
+
+Чтобы экспортировать ригованную модель:
+
+1. Отметьте **Rig + Anim** на панели. Это принудительно включит формат **GLTF** (OBJ отключён, так как не несёт данные рига).
+2. Дождитесь полной загрузки модели и проиграйте/прокрутите анимацию хотя бы один раз, чтобы вьювер загрузил скелет и дорожки анимации.
+3. Нажмите **EXPORT & DOWNLOAD**. Скрипт захватывает кости (с их локальными TRS и иерархией родителей), индексы суставов + веса на вершину, обратные матрицы связывания и каждую дорожку анимации (покадровые translation/rotation/scale на кость).
+4. Полученные `ModelName.gltf` + `ModelName.bin` открываются в Blender (`File → Import → glTF`) или Maya (`File → Import`) с рабочей арматурой и воспроизводимыми анимациями.
+
+> **О надёжности захвата:** вьювер Sketchfab минифицирован и не предоставляет документированного API рига. Скрипт пробует множество возможных внутренних имён свойств для skin / joints / weights / skeleton / animations. На большинстве ригованных моделей это срабатывает; если конкретная модель хранит скиннинг под необычными именами, счётчики Bones/Anims могут остаться 0 — в таком случае включите консоль браузера и ищите строки `[LikolusExport]`, чтобы увидеть, что именно проверялось.
 
 ### Поддержка PBR-карт
 
