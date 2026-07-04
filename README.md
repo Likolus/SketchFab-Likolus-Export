@@ -36,7 +36,7 @@ Open the `.obj` in Maya or Blender → the MTL loads automatically, textures res
 - **Single combined OBJ** — every captured geometry becomes a group (`o name` + `usemtl name`) inside one `ModelName.obj`, with continuous global vertex/uv/normal indexing across groups. No more pile of loose `model_N.obj` files.
 - **Real MTL** — a proper `.mtl` is generated and referenced via `mtllib`. Each group has its own material assigned with `usemtl`, so materials actually show up in Maya/Blender.
 - **Correct material → texture linking** — each material is bound to its textures by (a) capturing the currently-bound GL texture at draw time, and (b) name-prefix matching against the geometry's stateset name.
-- **Full-resolution original textures** — textures are downloaded from their **original URLs** via `GM_xmlhttpRequest`, preserving full resolution, original format (`.jpg`/`.png`) and correct orientation. `readPixels` is only a fallback.
+- **Reliable texture capture (SUR principle)** — texture pixels are captured **at the fullscreen `drawArrays` pass** via `gl.readPixels` while the texture is live and bound, then flipped vertically and encoded to PNG. This is the proven approach from SUR and avoids the broken-pixels problem of re-reading textures at export time (when the GL context state has changed). Original-URL fetch via `GM_xmlhttpRequest` is a secondary enhancement; export-time `readPixels` is only a last-resort fallback.
 - **Complete PBR map set** — albedo, normal, roughness, metallic, specular, emissive, opacity and AO are all classified and emitted with the right MTL keys.
 - **Relative texture paths** — textures live in a `textures/` subfolder and the MTL references them as `textures/...`, so paths resolve on any OS without editing.
 - **GLTF export** — alternative GLTF + `.bin` output (with PBR textures) for pipelines that prefer it.
@@ -120,20 +120,21 @@ The Sketchfab viewer is a minified WebGL application. The script intercepts the 
 |---|---|
 | `renderInto(n,E,R` → `…,i` | capture texture-pipeline variable |
 | `renderInto=function(e,i,r` → `…,image_data` | thread image data |
-| `drawArrays(TRIANGLES,0,6)` → `…,window.drawhookimg(gl,t)` | texture-pass capture |
+| `drawArrays(TRIANGLES,0,6)` → `…,window.drawhookimg(t,image_data)` | texture-pass pixel capture (readPixels at draw time) |
 | `getResourceImage:function(e,t){` → `…; e = window.drawhookcanvas(e,this._imageModel);` | texture metadata + URL capture |
-| `drawGeometry(this._graphicContext,t)` → `…; window.attachbody(t,this._graphicContext);` | geometry capture + bound-texture read |
+| `drawGeometry(this._graphicContext,t)` → `…; window.attachbody(t);` | geometry capture (bound texture read via `lastGLCtx`) |
 
 At draw time:
 
-- **`attachbody(t, glCtx)`** records the geometry (vertices, normals, UVs, indices, primitive modes) **and** queries `glCtx.getParameter(TEXTURE_BINDING_2D)` to find the currently-bound texture, linking the geometry's material to that texture directly.
+- **`attachbody(t)`** records the geometry (vertices, normals, UVs, indices, primitive modes) **and** queries `lastGLCtx.getParameter(TEXTURE_BINDING_2D)` to find the currently-bound texture, linking the geometry's material to that texture directly.
 - **`drawhookcanvas(e, imageModel)`** records each texture's name, PBR type (classified by name), and **original download URL** (largest power-of-two variant).
-- A global `texImage2D` hook builds a `WebGLTexture → URL` map used both for bound-texture resolution and as a readPixels fallback.
+- **`drawhookimg(gl, image_data)`** — at the fullscreen `drawArrays(TRIANGLES,0,6)` pass — calls `gl.readPixels` **immediately** while the texture is bound and being rendered, flips the result vertically, and stores the PNG blob. This is the reliable capture path (re-reading at export time yields broken/recycled pixels).
+- A global `texImage2D` hook records `lastGLCtx` and builds a `WebGLTexture → URL` map used for bound-texture resolution and as a last-resort fallback.
 
 At export time:
 
 1. `buildMaterials()` creates one material per geometry and links textures by (a) the bound texture captured at draw time, then (b) name-prefix matching against the geometry's stateset name, then (c) for single-geometry models, assigning all textures by type.
-2. `fetchAllTextures()` downloads each texture from its original URL via `GM_xmlhttpRequest` (full-res, original `.jpg`/`.png`, correct orientation). If a URL fetch fails, it falls back to `readPixels` from a framebuffer (with correct vertical flip).
+2. `fetchAllTextures()` first reuses the blobs already captured at draw time by `drawhookimg`. For any missing textures, it tries the original URL via `GM_xmlhttpRequest`; as a last resort it attaches the GL texture to a framebuffer and `readPixels` (with correct vertical flip).
 3. `buildObj()` writes **one** combined `.obj` with `o`/`usemtl` per group and correct per-group vertex/uv/normal index offsets — so a 30-part model is one file with 30 groups, not 30 files.
 4. `buildMtl()` writes the `.mtl` with `map_Kd`/`map_Bump`/`map_Pr`/`map_Pm`/`map_Ks`/`map_Ke`/`map_d` referencing `textures/…`.
 5. JSZip packages everything; FileSaver triggers the download.
@@ -190,7 +191,7 @@ ModelName/
 - **Единый объединённый OBJ** — каждая захваченная геометрия становится группой (`o имя` + `usemtl имя`) внутри одного `ModelName.obj` со сквозной глобальной нумерацией вершин/UV/нормалей между группами. Никакой кучи отдельных `model_N.obj`.
 - **Настоящий MTL** — генерируется корректный `.mtl`, на который ссылается `mtllib`. Каждой группе назначается свой материал через `usemtl`, поэтому материалы действительно отображаются в Maya/Blender.
 - **Корректная связь материал → текстура** — каждый материал привязывается к своим текстурам (а) захватом активной GL-текстуры в момент отрисовки и (б) сопоставлением префикса имени с именем stateset геометрии.
-- **Оригинальные текстуры в полном разрешении** — текстуры скачиваются по **оригинальным URL** через `GM_xmlhttpRequest`, сохраняя полное разрешение, исходный формат (`.jpg`/`.png`) и правильную ориентацию. `readPixels` используется только как запасной вариант.
+- **Надёжный захват текстур (принцип SUR)** — пиксели текстур захватываются **в момент полноэкранного прохода `drawArrays`** через `gl.readPixels`, пока текстура активна и привязана, затем отражаются по вертикали и кодируются в PNG. Это проверенный подход из SUR, он избегает проблемы битых пикселей при повторном чтении текстур во время экспорта (когда состояние GL-контекста уже изменилось). Загрузка по оригинальному URL через `GM_xmlhttpRequest` — вторичное улучшение; `readPixels` при экспорте только крайний запасной вариант.
 - **Полный набор PBR-карт** — albedo, normal, roughness, metallic, specular, emissive, opacity и AO классифицируются и выводятся с нужными MTL-ключами.
 - **Относительные пути к текстурам** — текстуры лежат в подпапке `textures/`, а MTL ссылается на них как `textures/...`, поэтому пути работают на любой ОС без правок.
 - **Экспорт в GLTF** — альтернативный вывод GLTF + `.bin` (с PBR-текстурами) для пайплайнов, где это удобнее.
@@ -274,20 +275,21 @@ ModelName/
 |---|---|
 | `renderInto(n,E,R` → `…,i` | захват переменной текстурного конвейера |
 | `renderInto=function(e,i,r` → `…,image_data` | передача данных изображения |
-| `drawArrays(TRIANGLES,0,6)` → `…,window.drawhookimg(gl,t)` | захват текстурного прохода |
+| `drawArrays(TRIANGLES,0,6)` → `…,window.drawhookimg(t,image_data)` | захват пикселей текстуры (readPixels при отрисовке) |
 | `getResourceImage:function(e,t){` → `…; e = window.drawhookcanvas(e,this._imageModel);` | захват метаданных текстуры + URL |
-| `drawGeometry(this._graphicContext,t)` → `…; window.attachbody(t,this._graphicContext);` | захват геометрии + чтение связанной текстуры |
+| `drawGeometry(this._graphicContext,t)` → `…; window.attachbody(t);` | захват геометрии (чтение связанной текстуры через `lastGLCtx`) |
 
 Во время отрисовки:
 
-- **`attachbody(t, glCtx)`** записывает геометрию (вершины, нормали, UV, индексы, режимы примитивов) **и** опрашивает `glCtx.getParameter(TEXTURE_BINDING_2D)`, чтобы найти текущую привязанную текстуру — напрямую связывая материал геометрии с этой текстурой.
+- **`attachbody(t)`** записывает геометрию (вершины, нормали, UV, индексы, режимы примитивов) **и** опрашивает `lastGLCtx.getParameter(TEXTURE_BINDING_2D)`, чтобы найти текущую привязанную текстуру — напрямую связывая материал геометрии с этой текстурой.
 - **`drawhookcanvas(e, imageModel)`** записывает имя каждой текстуры, её PBR-тип (определяется по имени) и **оригинальный URL скачивания** (наибольший вариант со степенью двойки).
-- Глобальный хук `texImage2D` строит карту `WebGLTexture → URL`, используемую как для разрешения связанных текстур, так и как запасной вариант для readPixels.
+- **`drawhookimg(gl, image_data)`** — в момент полноэкранного прохода `drawArrays(TRIANGLES,0,6)` — вызывает `gl.readPixels` **немедленно**, пока текстура привязана и отрисовывается, отражает результат по вертикали и сохраняет PNG-blob. Это надёжный путь захвата (повторное чтение при экспорте даёт битые/переработанные пиксели).
+- Глобальный хук `texImage2D` запоминает `lastGLCtx` и строит карту `WebGLTexture → URL`, используемую для разрешения связанных текстур и как крайний запасной вариант.
 
 Во время экспорта:
 
 1. `buildMaterials()` создаёт по одному материалу на геометрию и привязывает текстуры (а) по захваченной при отрисовке активной текстуре, затем (б) по совпадению префикса имени с именем stateset геометрии, затем (в) для моделей с одной геометрией — назначая все текстуры по типу.
-2. `fetchAllTextures()` скачивает каждую текстуру по её оригинальному URL через `GM_xmlhttpRequest` (полное разрешение, исходный `.jpg`/`.png`, правильная ориентация). Если загрузка по URL не удалась, используется запасной `readPixels` из framebuffer (с корректным вертикальным отражением).
+2. `fetchAllTextures()` сначала переиспользует blob'ы, уже захваченные при отрисовке функцией `drawhookimg`. Для недостающих текстур пробует оригинальный URL через `GM_xmlhttpRequest`; как крайний случай — привязывает GL-текстуру к framebuffer и делает `readPixels` (с корректным вертикальным отражением).
 3. `buildObj()` записывает **один** объединённый `.obj` с `o`/`usemtl` на группу и корректными смещениями индексов вершин/UV/нормалей для каждой группы — поэтому модель из 30 частей это один файл с 30 группами, а не 30 файлов.
 4. `buildMtl()` записывает `.mtl` с `map_Kd`/`map_Bump`/`map_Pr`/`map_Pm`/`map_Ks`/`map_Ke`/`map_d`, ссылающимися на `textures/…`.
 5. JSZip упаковывает всё; FileSaver инициирует скачивание.
