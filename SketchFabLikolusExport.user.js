@@ -68,6 +68,20 @@
     var glTextureMeta = new Map();
     var glTextureIdx = 0;
 
+    // ----------------------------- rig --------------------------------
+    // Skeleton: bones captured from the viewer's scene graph.
+    //   boneMap: objectRef -> bone index (dedup)
+    //   bones[]: { name, ref, parentRef, translation, rotation, scale, ibm }
+    var rigBones = [];
+    var rigBoneMap = new WeakMap();
+    // Skin data per geometry: { joints:[boneIdx], ibm:[Float32Array(16)...],
+    //   jointAttr:Float32Array, weightAttr:Float32Array }
+    var rigSkinByGeoIdx = {};
+    // Animations: [{ name, duration, channels:[{boneIdx, path, times:Float32Array, values:Float32Array}] }]
+    var rigAnimations = [];
+    var rigSceneRoots = [];   // candidate scene root refs probed for animations
+    var rigCaptureTried = false;
+
     var DEBUG = false;
     var OBJ_CHUNK_LIMIT = 1024 * 1024;
 
@@ -140,7 +154,8 @@
         scale: 1.0,
         flipUV: false,       // flip V (1-v) for UVs — off by default
         combineObj: true,    // single model.obj with groups
-        fetchOriginalTextures: true
+        fetchOriginalTextures: true,
+        rig: false           // capture skeleton + skin weights + animations (forces glTF)
     };
 
     // --------------------------- UI ----------------------------------
@@ -159,6 +174,8 @@
               '<div style="display:flex;gap:8px;margin-bottom:8px;">' +
                 '<div style="flex:1;"><div style="color:#8b949e;font-size:11px;margin-bottom:2px;">Geometries</div><div id="lkx-ngeo" style="font-weight:600;font-size:15px;color:#58a6ff;">0</div></div>' +
                 '<div style="flex:1;"><div style="color:#8b949e;font-size:11px;margin-bottom:2px;">Textures</div><div id="lkx-ntex" style="font-weight:600;font-size:15px;color:#3fb950;">0</div></div>' +
+                '<div style="flex:1;"><div style="color:#8b949e;font-size:11px;margin-bottom:2px;">Bones</div><div id="lkx-nbone" style="font-weight:600;font-size:15px;color:#d2a8ff;">0</div></div>' +
+                '<div style="flex:1;"><div style="color:#8b949e;font-size:11px;margin-bottom:2px;">Anims</div><div id="lkx-nanim" style="font-weight:600;font-size:15px;color:#d2a8ff;">0</div></div>' +
               '</div>' +
               '<div style="border-top:1px solid #2a2f37;padding-top:10px;margin-bottom:8px;">' +
                 '<div style="color:#8b949e;font-size:11px;margin-bottom:4px;">Format</div>' +
@@ -168,7 +185,8 @@
               '<div style="display:flex;gap:8px;margin-bottom:8px;">' +
                 '<label style="flex:1;color:#8b949e;font-size:11px;">Scale<br><input type="number" id="lkx-scale" value="1.0" step="0.1" style="width:100%;box-sizing:border-box;background:#0d1117;color:#e8eaed;border:1px solid #2a2f37;border-radius:4px;padding:3px 5px;"></label>' +
                 '<label style="flex:1;color:#8b949e;font-size:11px;display:flex;flex-direction:column;">Options<br>' +
-                  '<span style="margin-top:2px;"><input type="checkbox" id="lkx-flipuv"> Flip UV V</span>' +
+                  '<span style="margin-top:2px;"><input type="checkbox" id="lkx-rig"> Rig + Anim <span style="color:#d2a8ff;">(glTF)</span></span>' +
+                  '<span><input type="checkbox" id="lkx-flipuv"> Flip UV V</span>' +
                   '<span><input type="checkbox" id="lkx-texonly"> Textures only</span>' +
                 '</label>' +
               '</div>' +
@@ -191,6 +209,16 @@
             var sc = document.getElementById('lkx-scale'); if (sc) sc.addEventListener('change', function (e) { settings.scale = parseFloat(e.target.value) || 1.0; });
             var fu = document.getElementById('lkx-flipuv'); if (fu) fu.addEventListener('change', function (e) { settings.flipUV = e.target.checked; });
             var to = document.getElementById('lkx-texonly'); if (to) to.addEventListener('change', function (e) { settings.texturesOnly = e.target.checked; });
+            var rg = document.getElementById('lkx-rig'); if (rg) rg.addEventListener('change', function (e) {
+                settings.rig = e.target.checked;
+                if (settings.rig) {
+                    // rig requires glTF; switch format radio + setting
+                    settings.format = 'gltf';
+                    var ob = document.querySelector('input[name="lkx-fmt"][value="obj"]');
+                    var gl = document.querySelector('input[name="lkx-fmt"][value="gltf"]');
+                    if (ob) ob.checked = false; if (gl) gl.checked = true;
+                }
+            });
         }, 50);
         return ui;
     }
@@ -209,6 +237,8 @@
         ensureUI();
         var g = document.getElementById('lkx-ngeo'); if (g) g.textContent = String(geometries.length);
         var t = document.getElementById('lkx-ntex'); if (t) t.textContent = String(Object.keys(textureStore).length);
+        var b = document.getElementById('lkx-nbone'); if (b) b.textContent = String(rigBones.length);
+        var a = document.getElementById('lkx-nanim'); if (a) a.textContent = String(rigAnimations.length);
     }
     function status(msg) { setMsg(msg); dlog(msg); updateCounts(); }
 
@@ -245,8 +275,9 @@
                 }
             } catch (e) {}
 
+            var geoIdx = geometries.length;
             geometries.push({
-                name: sanitizeFileName(nm, 'part_' + geometries.length),
+                name: sanitizeFileName(nm, 'part_' + geoIdx),
                 rawName: nm,
                 vertex: attr.Vertex._elements,
                 normal: attr.Normal ? attr.Normal._elements : null,
@@ -255,6 +286,8 @@
                 boundTexUrl: boundTexUrl
             });
             status('Captured geometry: ' + nm + (boundTexUrl ? ' (+texture)' : ''));
+            // try to capture rig (skin + skeleton) for this geometry
+            try { captureRigFromGeometry(t, geoIdx, attr); } catch (e) { dlog('captureRig error', e); }
         } catch (e) { dlog('attachbody error', e); }
     };
 
@@ -675,13 +708,247 @@
         return new Blob([lines.join('\n') + '\n'], { type: 'text/plain' });
     }
 
+    // --------------------------- rig capture -------------------------
+    // Defensive probing: Sketchfab's viewer is minified and property names vary.
+    // We probe many candidates for skin / joints / weights / skeleton / animations.
+
+    function probeAttr(attr, names) {
+        if (!attr) return null;
+        for (var i = 0; i < names.length; i++) {
+            var k = names[i];
+            if (attr[k] && attr[k]._elements) return attr[k]._elements;
+        }
+        return null;
+    }
+
+    // Decompose a (column-major) 4x4 matrix into translation, rotation (xyzw quat), scale.
+    function decomposeMat4(m) {
+        var t = [m[12], m[13], m[14]];
+        var sx = Math.hypot(m[0], m[1], m[2]);
+        var sy = Math.hypot(m[4], m[5], m[6]);
+        var sz = Math.hypot(m[8], m[9], m[10]);
+        var s = [sx, sy, sz];
+        // normalized rotation 3x3
+        var r00 = m[0] / sx, r01 = m[1] / sx, r02 = m[2] / sx;
+        var r10 = m[4] / sy, r11 = m[5] / sy, r12 = m[6] / sy;
+        var r20 = m[8] / sz, r21 = m[9] / sz, r22 = m[10] / sz;
+        // quaternion from rotation matrix
+        var tr = r00 + r11 + r22;
+        var qw, qx, qy, qz;
+        if (tr > 0) {
+            var sq = Math.sqrt(tr + 1) * 2;
+            qw = 0.25 * sq; qx = (r21 - r12) / sq; qy = (r02 - r20) / sq; qz = (r10 - r01) / sq;
+        } else if (r00 > r11 && r00 > r22) {
+            var sq = Math.sqrt(1 + r00 - r11 - r22) * 2;
+            qw = (r21 - r12) / sq; qx = 0.25 * sq; qy = (r01 + r10) / sq; qz = (r02 + r20) / sq;
+        } else if (r11 > r22) {
+            var sq = Math.sqrt(1 + r11 - r00 - r22) * 2;
+            qw = (r02 - r20) / sq; qx = (r01 + r10) / sq; qy = 0.25 * sq; qz = (r12 + r21) / sq;
+        } else {
+            var sq = Math.sqrt(1 + r22 - r00 - r11) * 2;
+            qw = (r10 - r01) / sq; qx = (r02 + r20) / sq; qy = (r12 + r21) / sq; qz = 0.25 * sq;
+        }
+        return { translation: t, rotation: [qx, qy, qz, qw], scale: s };
+    }
+
+    function getMatElements(obj) {
+        if (!obj) return null;
+        var cands = ['_matrix', '_localMatrix', '_modelMatrix', 'matrix', 'localMatrix', 'modelMatrix', '_worldMatrix', 'worldMatrix'];
+        for (var i = 0; i < cands.length; i++) {
+            var m = obj[cands[i]];
+            if (m) {
+                if (m._elements) return m._elements;
+                if (m.elements) return m.elements;
+                if (m instanceof Float32Array || m instanceof Float64Array || (m && m.length === 16)) return m;
+            }
+        }
+        return null;
+    }
+
+    function getTRS(obj) {
+        // prefer explicit TRS, else decompose matrix
+        var t = obj._translation || obj.translation || obj._position || obj.position;
+        var r = obj._rotation || obj.rotation || obj._quaternion || obj.quaternion;
+        var s = obj._scale || obj.scale || obj._scaling || obj.scaling;
+        var tr = [0, 0, 0], rr = [0, 0, 0, 1], sr = [1, 1, 1];
+        if (t) { tr = (t._elements || t.elements || t); if (tr.length >= 3) tr = [tr[0], tr[1], tr[2]]; }
+        if (r) { rr = (r._elements || r.elements || r); if (rr.length >= 4) rr = [rr[0], rr[1], rr[2], rr[3]]; else if (rr.length === 3) rr = [rr[0], rr[1], rr[2], Math.sqrt(Math.max(0, 1 - rr[0] * rr[0] - rr[1] * rr[1] - rr[2] * rr[2]))]; }
+        if (s) { sr = (s._elements || s.elements || s); if (sr.length >= 3) sr = [sr[0], sr[1], sr[2]]; }
+        var mat = getMatElements(obj);
+        if (mat) {
+            var d = decomposeMat4(mat);
+            // matrix overrides if TRS not explicit — but keep explicit TRS when present
+            if (!t) tr = d.translation;
+            if (!r) rr = d.rotation;
+            if (!s) sr = d.scale;
+        }
+        return { translation: tr, rotation: rr, scale: sr };
+    }
+    // (split name to avoid collision in the getter above)
+    function getMatElement_s(obj) { return getMatElement_s_inner(obj); }
+    function getMatElement_s_inner(obj) { return getMatElement(obj); }
+
+    function registerBone(ref, parentRef) {
+        if (!ref) return -1;
+        if (rigBoneMap.has(ref)) return rigBoneMap.get(ref);
+        var nm = (ref._name || ref.name || ('bone_' + rigBones.length));
+        var trs = getTRS(ref);
+        var bone = { name: sanitizeFileName(nm, 'bone_' + rigBones.length), ref: ref, parentRef: parentRef || null, translation: trs.translation, rotation: trs.rotation, scale: trs.scale, ibm: null };
+        var idx = rigBones.length;
+        rigBones.push(bone);
+        rigBoneMap.set(ref, idx);
+        return idx;
+    }
+
+    // Walk a node's parent chain up to register ancestor bones (so hierarchy is preserved).
+    function registerAncestors(node) {
+        var parent = null;
+        try {
+            var ps = node._parents || node.parents || node._parent;
+            if (ps && ps.length) parent = ps[0];
+            else if (ps) parent = ps;
+        } catch (e) {}
+        if (parent) {
+            var pidx = registerBone(parent, null);
+            registerAncestors(parent);
+            return pidx;
+        }
+        return -1;
+    }
+
+    function captureRigFromGeometry(t, geoIdx, attr) {
+        // 1) find a skin / skeleton reference on the geometry or its parents
+        var skin = null;
+        var probeObjs = [t];
+        try { var ps = t._parents || t.parents; if (ps && ps.length) probeObjs.push(ps[0]); } catch (e) {}
+        var skinKeys = ['_skin', 'skin', '_skeleton', 'skeleton', '_rig', 'rig', '_armature', 'armature'];
+        outer: for (var oi = 0; oi < probeObjs.length; oi++) {
+            var o = probeObjs[oi]; if (!o) continue;
+            for (var ki = 0; ki < skinKeys.length; ki++) {
+                if (o[skinKeys[ki]]) { skin = o[skinKeys[ki]]; break outer; }
+            }
+        }
+        // 2) find joint indices + weight attributes (many possible names)
+        var jointAttr = probeAttr(attr, ['Joints0', 'JointIndices', 'BoneIndices', 'SkinJoints', 'JOINTS_0', 'Joints', 'Bones', 'BoneWeights0']);
+        var weightAttr = probeAttr(attr, ['Weights0', 'BoneWeights', 'SkinWeights', 'WEIGHTS_0', 'Weights', 'SkinWeights0']);
+        // Some viewers store 8 influences (Joints0+Joints1); we take Joints0 (4) which glTF supports by default.
+        if (!jointAttr || !weightAttr) {
+            // no skinning on this geometry — that's fine, it's a static part
+            return;
+        }
+        // 3) resolve joints list + inverse bind matrices
+        var joints = [];      // array of bone indices
+        var ibms = [];        // array of Float32Array(16)
+        var jointRefs = null;
+        var ibmArr = null;
+        if (skin) {
+            jointRefs = skin._joints || skin.joints || skin._bones || skin.bones || skin._jointList;
+            ibmArr = skin._inverseBindMatrices || skin.inverseBindMatrices || skin._bindMatrices || skin.bindMatrices || skin._inverseBindMatrix || skin._ibm;
+            // also probe skeleton root for animation scanning
+            var root = skin._skeleton || skin.skeleton || skin._root || skin.root;
+            if (root && rigSceneRoots.indexOf(root) < 0) rigSceneRoots.push(root);
+        }
+        if (jointRefs && jointRefs.length) {
+            for (var j = 0; j < jointRefs.length; j++) {
+                var jref = jointRefs[j];
+                var pidx = registerAncestors(jref);
+                var bidx = registerBone(jref, pidx >= 0 ? rigBones[pidx].ref : null);
+                joints.push(bidx);
+                var ibm = null;
+                if (ibmArr) {
+                    var src = ibmArr[j];
+                    if (src) {
+                        var el = src._elements || src.elements || src;
+                        if (el && el.length >= 16) { ibm = new Float32Array(16); for (var k = 0; k < 16; k++) ibm[k] = el[k]; }
+                    }
+                }
+                ibms.push(ibm);
+                if (rigBones[bidx]) rigBones[bidx].ibm = ibm;
+            }
+        } else {
+            // no joint list — derive bones from the unique joint indices in the attribute
+            var maxIdx = -1;
+            for (var v = 0; v < jointAttr.length; v++) { var iv = jointAttr[v] | 0; if (iv > maxIdx) maxIdx = iv; }
+            for (var b = 0; b <= maxIdx && b < 256; b++) { joints.push(registerBone({ _name: 'bone_' + b }, null)); }
+        }
+        // record skin for this geometry
+        rigSkinByGeoIdx[geoIdx] = { joints: joints, ibm: ibms, jointAttr: jointAttr, weightAttr: weightAttr };
+        status('Captured rig for ' + (geometries[geoIdx] ? geometries[geoIdx].name : 'geo') + ': ' + joints.length + ' joints');
+    }
+
+    // Scan candidate scene roots for animation tracks. Called once before export.
+    function captureAnimations() {
+        if (rigCaptureTried) return;
+        rigCaptureTried = true;
+        try {
+            // probe window + a few known roots for animation collections
+            var roots = rigSceneRoots.slice();
+            // also try the global scene if exposed
+            try { if (window.scene) roots.push(window.scene); } catch (e) {}
+            try { if (window.app && window.app.scene) roots.push(window.app.scene); } catch (e) {}
+            var animCollections = [];
+            for (var i = 0; i < roots.length; i++) {
+                var r = roots[i]; if (!r) continue;
+                var coll = r._animations || r.animations || r._clips || r.clips || r._tracks;
+                if (coll && coll.length) animCollections.push(coll);
+            }
+            // also probe a global animation player
+            try { if (window._animationPlayer && window._animationPlayer._animations) animCollections.push(window._animationPlayer._animations); } catch (e) {}
+            for (var c = 0; c < animCollections.length; c++) {
+                var coll2 = animCollections[c];
+                for (var a = 0; a < coll2.length; a++) {
+                    parseAnimation(coll2[a]);
+                }
+            }
+            if (rigAnimations.length) status('Captured ' + rigAnimations.length + ' animation(s)');
+        } catch (e) { dlog('captureAnimations error', e); }
+    }
+
+    function parseAnimation(anim) {
+        if (!anim) return;
+        var name = anim._name || anim.name || ('anim_' + rigAnimations.length);
+        var duration = anim._duration || anim.duration || 0;
+        var channels = [];
+        // Common shapes: anim.tracks[] each {node/bone, path, times[], values[]}
+        // or anim.channels[] + anim.samplers[]
+        var tracks = anim._tracks || anim.tracks || anim._channels || anim.channels;
+        if (tracks && tracks.length) {
+            for (var i = 0; i < tracks.length; i++) {
+                var tr = tracks[i];
+                var nodeRef = tr._node || tr.node || tr._target || tr.target || tr._bone || tr.bone;
+                if (!nodeRef) continue;
+                var bidx = rigBoneMap.has(nodeRef) ? rigBoneMap.get(nodeRef) : -1;
+                if (bidx < 0) {
+                    // try register on the fly
+                    bidx = registerBone(nodeRef, null);
+                }
+                var path = (tr._path || tr.path || 'translation').toLowerCase();
+                if (path === 'position') path = 'translation';
+                if (path === 'rotation') path = 'rotation';
+                if (path === 'scaling' || path === 'scale') path = 'scale';
+                var times = tr._times || tr.times || (tr._input && (tr._input._elements || tr._input.elements || tr._input)) || (tr.input && (tr.input._elements || tr.input.elements || tr.input));
+                var values = tr._values || tr.values || (tr._output && (tr._output._elements || tr._output.elements || tr._output)) || (tr.output && (tr.output._elements || tr.output.elements || tr.output));
+                if (!times || !values) continue;
+                times = Float32Array.from(times.length != null ? times : []);
+                values = Float32Array.from(values.length != null ? values : []);
+                if (!times.length || !values.length) continue;
+                if (times[times.length - 1] > duration) duration = times[times.length - 1];
+                channels.push({ boneIdx: bidx, path: path, times: times, values: values });
+            }
+        }
+        if (channels.length) {
+            rigAnimations.push({ name: sanitizeFileName(name, 'anim_' + rigAnimations.length), duration: duration, channels: channels });
+        }
+    }
+
     // -------------------------- GLTF writer --------------------------
     function buildGLTF(modelName) {
         var gltf = {
             asset: { version: '2.0', generator: 'SketchFab Likolus Export' },
             scenes: [{ nodes: [] }], scene: 0, nodes: [], meshes: [],
             accessors: [], bufferViews: [], buffers: [{ uri: modelName + '.bin', byteLength: 0 }],
-            materials: [], textures: [], images: [], samplers: [{ magFilter: 9729, minFilter: 9987, wrapS: 10497, wrapT: 10497 }]
+            materials: [], textures: [], images: [], samplers: [{ magFilter: 9729, minFilter: 9987, wrapS: 10497, wrapT: 10497 }],
+            skins: [], animations: []
         };
         var binParts = [], offset = 0;
         function addToBin(data, target, type, ct, count) {
@@ -694,9 +961,9 @@
             gltf.accessors.push({ bufferView: vi, byteOffset: 0, componentType: ct, count: count, type: type });
             binParts.push(data); offset += bl; return ai;
         }
+
         var materials = buildMaterials();
         // images + textures + materials (glTF PBR)
-        var texIdxByType = {};
         materials.forEach(function (m) {
             var imgIdxFor = {};
             ['albedo', 'normal', 'roughness', 'metallic', 'emissive', 'occlusion'].forEach(function (ty) {
@@ -717,24 +984,147 @@
             if (imgIdxFor.occlusion != null) mat.occlusionTexture = { index: imgIdxFor.occlusion };
             gltf.materials.push(mat);
         });
+
+        // --- skeleton nodes (bones) ---
+        // One glTF node per captured bone, with TRS + parent linking via children.
+        var boneNodeIdx = [];   // boneIdx -> glTF node index
+        var boneChildMap = {};  // parentBoneIdx -> [childBoneIdx]
+        for (var bi = 0; bi < rigBones.length; bi++) {
+            var bone = rigBones[bi];
+            var nIdx = gltf.nodes.length;
+            boneNodeIdx.push(nIdx);
+            var node = { name: bone.name, translation: bone.translation.slice(0, 3), rotation: bone.rotation.slice(0, 4), scale: bone.scale.slice(0, 3) };
+            gltf.nodes.push(node);
+        }
+        // link children: a bone's parent is whichever bone has ref === bone.parentRef
+        for (var bi2 = 0; bi2 < rigBones.length; bi2++) {
+            var b2 = rigBones[bi2];
+            var pRef = b2.parentRef;
+            var pBoneIdx = -1;
+            if (pRef) {
+                for (var k = 0; k < rigBones.length; k++) { if (rigBones[k].ref === pRef) { pBoneIdx = k; break; } }
+            }
+            if (pBoneIdx >= 0) {
+                if (!boneChildMap[pBoneIdx]) boneChildMap[pBoneIdx] = [];
+                boneChildMap[pBoneIdx].push(boneNodeIdx[bi2]);
+            }
+        }
+        for (var pp in boneChildMap) { if (gltf.nodes[boneNodeIdx[pp]]) gltf.nodes[boneNodeIdx[pp]].children = boneChildMap[pp]; }
+
+        // --- meshes + mesh nodes (with skin reference when skinned) ---
+        var meshRootNodes = [];
         geometries.forEach(function (g, i) {
             if (!g.vertex || !g.vertex.length) return;
             var pos = addToBin(new Float32Array(g.vertex), 34962, 'VEC3', 5126, g.vertex.length / 3);
             var norm = g.normal && g.normal.length ? addToBin(new Float32Array(g.normal), 34962, 'VEC3', 5126, g.normal.length / 3) : -1;
             var uv = g.uv && g.uv.length ? addToBin(new Float32Array(g.uv), 34962, 'VEC2', 5126, g.uv.length / 2) : -1;
             var prims = [];
+            var skinObj = rigSkinByGeoIdx[i];
+
+            // skin attributes: JOINTS_0 + WEIGHTS_0
+            var jointsAcc = -1, weightsAcc = -1;
+            if (skinObj) {
+                var vcount = g.vertex.length / 3;
+                var ja = skinObj.jointAttr;
+                var wa = skinObj.weightAttr;
+                // glTF expects 4 influences per vertex (already 4-per-vertex in most viewers)
+                var perVert = (ja.length / vcount) | 0;
+                if (perVert < 1) perVert = 4;
+                var jointCount = vcount * 4;
+                var jArr, jCt;
+                if (skinObj.joints.length <= 256) {
+                    jArr = new Uint8Array(jointCount); jCt = 5121;
+                } else {
+                    jArr = new Uint16Array(jointCount); jCt = 5123;
+                }
+                var wArr = new Float32Array(jointCount);
+                // remap joint index values (which are indices into skinObj.joints) to bone node indices
+                for (var vv = 0; vv < vcount; vv++) {
+                    for (var c = 0; c < 4; c++) {
+                        var srcIdx = vv * perVert + c;
+                        var jv = (srcIdx < ja.length ? (ja[srcIdx] | 0) : 0);
+                        var mapped = (jv < skinObj.joints.length) ? skinObj.joints[jv] : 0;
+                        jArr[vv * 4 + c] = mapped;
+                        wArr[vv * 4 + c] = (srcIdx < wa.length ? wa[srcIdx] : 0);
+                    }
+                    // normalize weights
+                    var wsum = wArr[vv * 4] + wArr[vv * 4 + 1] + wArr[vv * 4 + 2] + wArr[vv * 4 + 3];
+                    if (wsum > 0) { for (var c2 = 0; c2 < 4; c2++) wArr[vv * 4 + c2] /= wsum; }
+                }
+                jointsAcc = addToBin(jArr, 34962, 'VEC4', jCt, vcount);
+                weightsAcc = addToBin(wArr, 34962, 'VEC4', 5126, vcount);
+            }
+
             g.primitives.forEach(function (p) {
                 var ind = addToBin(new Uint32Array(p.indices), 34963, 'SCALAR', 5125, p.indices.length);
                 var attr = { POSITION: pos };
                 if (norm !== -1) attr.NORMAL = norm;
                 if (uv !== -1) attr.TEXCOORD_0 = uv;
+                if (jointsAcc !== -1) { attr.JOINTS_0 = jointsAcc; attr.WEIGHTS_0 = weightsAcc; }
                 var prim = { attributes: attr, indices: ind, mode: (p.mode === 5 || p.mode === 6) ? 4 : (p.mode || 4), material: i };
                 prims.push(prim);
             });
             gltf.meshes.push({ name: g.name, primitives: prims });
-            gltf.nodes.push({ name: g.name, mesh: gltf.meshes.length - 1 });
-            gltf.scenes[0].nodes.push(gltf.nodes.length - 1);
+
+            // mesh node — references skin if skinned
+            var mnode = { name: g.name, mesh: gltf.meshes.length - 1 };
+            if (skinObj) {
+                // build skin: joints (bone node indices) + inverseBindMatrices accessor
+                var jointNodeIdxs = skinObj.joints.map(function (jb) { return boneNodeIdx[jb] || 0; });
+                // IBM accessor: collect 16 floats per joint, default identity if null
+                var ibmFlat = new Float32Array(jointNodeIdxs.length * 16);
+                var ident = [1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1];
+                for (var jj = 0; jj < jointNodeIdxs.length; jj++) {
+                    var m = skinObj.ibm[jj] || ident;
+                    for (var kk = 0; kk < 16; kk++) ibmFlat[jj * 16 + kk] = m[kk] != null ? m[kk] : ident[kk];
+                }
+                var ibmAcc = addToBin(ibmFlat, null, 'MAT4', 5126, jointNodeIdxs.length);
+                var skinIdx = gltf.skins.length;
+                gltf.skins.push({ joints: jointNodeIdxs, inverseBindMatrices: ibmAcc });
+                mnode.skin = skinIdx;
+            }
+            gltf.nodes.push(mnode);
+            meshRootNodes.push(gltf.nodes.length - 1);
         });
+
+        // scene: bone roots + mesh nodes
+        // bone roots = bones with no parent bone; attach them at scene root
+        var boneRootsAdded = [];
+        for (var br = 0; br < rigBones.length; br++) {
+            if (rigBones[br].parentRef == null) {
+                // verify no other bone claims it as parent? it's a root
+                gltf.scenes[0].nodes.push(boneNodeIdx[br]);
+                boneRootsAdded.push(boneNodeIdx[br]);
+            }
+        }
+        // meshes at scene root too
+        for (var mr = 0; mr < meshRootNodes.length; mr++) gltf.scenes[0].nodes.push(meshRootNodes[mr]);
+
+        // --- animations ---
+        for (var ai = 0; ai < rigAnimations.length; ai++) {
+            var anim = rigAnimations[ai];
+            var samplers = [];
+            var channels = [];
+            for (var ci = 0; ci < anim.channels.length; ci++) {
+                var ch = anim.channels[ci];
+                var targetNode = boneNodeIdx[ch.boneIdx];
+                if (targetNode == null) continue;
+                var inAcc = addToBin(new Float32Array(ch.times), null, 'SCALAR', 5126, ch.times.length);
+                var valPerKey, outType;
+                if (ch.path === 'translation') { valPerKey = 3; outType = 'VEC3'; }
+                else if (ch.path === 'scale') { valPerKey = 3; outType = 'VEC3'; }
+                else if (ch.path === 'rotation') { valPerKey = 4; outType = 'VEC4'; }
+                else { valPerKey = 1; outType = 'SCALAR'; }
+                var outAcc = addToBin(new Float32Array(ch.values), null, outType, 5126, (ch.values.length / valPerKey) | 0 || 1);
+                var sIdx = samplers.length;
+                samplers.push({ input: inAcc, output: outAcc, interpolation: 'LINEAR' });
+                channels.push({ sampler: sIdx, target: { node: targetNode, path: ch.path } });
+            }
+            if (channels.length) {
+                gltf.animations.push({ name: anim.name, samplers: samplers, channels: channels });
+            }
+        }
+
         gltf.buffers[0].byteLength = offset;
         return { json: JSON.stringify(gltf, null, 2), bin: new Blob(binParts, { type: 'application/octet-stream' }) };
     }
@@ -767,7 +1157,13 @@
             var root = zip.folder(modelName);
 
             if (!settings.texturesOnly) {
-                setMsg('Linking materials…'); setProgress(2);
+                // rig requires glTF (OBJ can't carry skeleton/skin/animation)
+                if (settings.rig) {
+                    settings.format = 'gltf';
+                    setMsg('Capturing animations…'); setProgress(2);
+                    captureAnimations();
+                }
+                setMsg('Linking materials…'); setProgress(3);
                 var materials = buildMaterials();
 
                 if (settings.format === 'obj') {
