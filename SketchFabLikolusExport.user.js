@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         SketchFab Likolus Export
 // @namespace    https://github.com/Likolus
-// @version      1.0.0
+// @version      1.1.0
 // @description  Export Sketchfab models to OBJ with correctly mapped materials & textures. Maya/Blender-ready: nothing lost, texture paths preserved. Improved fork of SUR (WulfSkol/gamedev44).
 // @author       Likolus
 // @match        https://sketchfab.com/*
