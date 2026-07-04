@@ -1,24 +1,8 @@
 # SketchFab Likolus Export
 
-A Tampermonkey UserScript that exports Sketchfab models **exactly as they look in the viewer** — as **OBJ + MTL + textures** with correctly mapped materials, so that opening in **Maya** or **Blender** loses nothing: geometry, UVs, normals, PBR textures and their paths all survive.
+A Tampermonkey UserScript that exports Sketchfab models **exactly as they look in the viewer** — as a **single, whole OBJ + MTL + textures** with correctly mapped materials, so that opening in **Maya** or **Blender** loses nothing: geometry, UVs, normals, PBR textures and their paths all survive.
 
-Improved fork of [SUR (Sketchfab Utility Ripper)](https://github.com/WulfSkol/SUR-SketchfabUtilityRipper) (which itself is a remake of gamedev44's Fabulous Ripper).
-
----
-
-## Why this fork?
-
-The upstream SUR script captures geometry and textures, but its **OBJ export is broken for DCC apps**:
-
-| Problem in SUR | Fixed here |
-|---|---|
-| `usemtl` is commented out → no material assignment | `usemtl` emitted per geometry group |
-| No `.mtl` file is generated (only a dangling `mtllib` reference) | Real `.mtl` with all PBR maps |
-| Textures saved loose in zip, never referenced by any material | MTL references each map via relative `textures/…` path |
-| No material→texture link | Bound-GL-texture capture **+** name-prefix matching |
-| readPixels fallback saves textures vertically flipped | Flip applied; PNG matches original orientation |
-| readPixels returns mipmap-level (often low-res) | Textures downloaded from **original URLs** via `GM_xmlhttpRequest` — full resolution, original format |
-| One `.obj` per captured geometry (messy) | Single combined `model.obj` with `o`/`g`/`usemtl` groups and correct index offsets |
+The model is exported as **one combined `.obj` file** containing every part as an internal group (`o` / `usemtl`) — never split into `model_0.obj`, `model_1.obj`, `model_2.obj`… the way older rippers did. A multi-material model (e.g. an aircraft with 30+ parts) lands as one `ModelName.obj` with 30+ groups inside, plus one `ModelName.mtl` that maps every group to its PBR textures.
 
 ---
 
@@ -28,8 +12,8 @@ The downloaded ZIP looks like:
 
 ```
 ModelName/
-├── ModelName.obj          # combined geometry, usemtl per group
-├── ModelName.mtl          # materials, all PBR map_Kd/map_Bump/map_Pr/map_Pm/map_Ke/map_d
+├── ModelName.obj          # ONE combined file: every part as an o/usemtl group
+├── ModelName.mtl          # materials, all PBR maps (map_Kd/map_Bump/map_Pr/...)
 ├── metadata.json          # source url, author, date, sketchfab id
 └── textures/
     ├── Body_albedo.jpg     # original full-res, original format
@@ -42,9 +26,22 @@ Open the `.obj` in Maya or Blender → the MTL loads automatically, textures res
 
 ---
 
+## Features
+
+- **Single combined OBJ** — every captured geometry becomes a group (`o name` + `usemtl name`) inside one `ModelName.obj`, with continuous global vertex/uv/normal indexing across groups. No more pile of loose `model_N.obj` files.
+- **Real MTL** — a proper `.mtl` is generated and referenced via `mtllib`. Each group has its own material assigned with `usemtl`, so materials actually show up in Maya/Blender.
+- **Correct material → texture linking** — each material is bound to its textures by (a) capturing the currently-bound GL texture at draw time, and (b) name-prefix matching against the geometry's stateset name.
+- **Full-resolution original textures** — textures are downloaded from their **original URLs** via `GM_xmlhttpRequest`, preserving full resolution, original format (`.jpg`/`.png`) and correct orientation. `readPixels` is only a fallback.
+- **Complete PBR map set** — albedo, normal, roughness, metallic, specular, emissive, opacity and AO are all classified and emitted with the right MTL keys.
+- **Relative texture paths** — textures live in a `textures/` subfolder and the MTL references them as `textures/...`, so paths resolve on any OS without editing.
+- **GLTF export** — alternative GLTF + `.bin` output (with PBR textures) for pipelines that prefer it.
+- **Progress UI** — per-stage progress bar (linking materials → fetching textures → writing OBJ/MTL → packaging) with live geometry/texture counts.
+
+---
+
 ## PBR map support
 
-The script classifies each captured texture by name and emits the appropriate MTL key (Blender & Maya 2018+ extended MTL):
+Each captured texture is classified by name and emitted with the appropriate MTL key (Blender & Maya 2018+ extended MTL):
 
 | Texture name keyword | MTL key |
 |---|---|
@@ -55,7 +52,7 @@ The script classifies each captured texture by name and emits the appropriate MT
 | specular / spec | `map_Ks` |
 | emissive / emission | `map_Ke` |
 | opacity / alpha / mask | `map_d` |
-| occlusion / ao | `# map_ao` (commented; no standard key) |
+| occlusion / ao | `# map_ao` (no standard key) |
 
 ---
 
@@ -107,7 +104,7 @@ At export time:
 
 1. `buildMaterials()` creates one material per geometry and links textures by (a) the bound texture captured at draw time, then (b) name-prefix matching against the geometry's stateset name, then (c) for single-geometry models, assigning all textures by type.
 2. `fetchAllTextures()` downloads each texture from its original URL via `GM_xmlhttpRequest` (full-res, original `.jpg`/`.png`, correct orientation). If a URL fetch fails, it falls back to `readPixels` from a framebuffer (with correct vertical flip).
-3. `buildObj()` writes one combined `.obj` with `o`/`usemtl` per group and correct per-group vertex/uv/normal index offsets.
+3. `buildObj()` writes **one** combined `.obj` with `o`/`usemtl` per group and correct per-group vertex/uv/normal index offsets — so a 30-part model is one file with 30 groups, not 30 files.
 4. `buildMtl()` writes the `.mtl` with `map_Kd`/`map_Bump`/`map_Pr`/`map_Pm`/`map_Ks`/`map_Ke`/`map_d` referencing `textures/…`.
 5. JSZip packages everything; FileSaver triggers the download.
 
@@ -124,9 +121,7 @@ At export time:
 
 ## Credits
 
-- Original Fabulous Ripper: **Risk** / [gamedev44](https://github.com/gamedev44/Fabulous-Ripper)
-- SUR (Fabulous Ripper Remake): [WulfSkol](https://github.com/WulfSkol/SUR-SketchfabUtilityRipper)
-- OBJ/MTL PBR export, texture-URL fetching, material linking, combined-obj writer: **Likolus**
+Built on the Sketchfab viewer hooking technique pioneered by **Risk** / [gamedev44](https://github.com/gamedev44/Fabulous-Ripper) and [WulfSkol](https://github.com/WulfSkol/SUR-SketchfabUtilityRipper). OBJ/MTL PBR export, original-texture fetching, material linking and the combined single-file OBJ writer by **Likolus**.
 
 ## License
 
