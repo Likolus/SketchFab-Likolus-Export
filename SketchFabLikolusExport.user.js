@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         SketchFab Likolus Export
 // @namespace    https://github.com/Likolus
-// @version      1.2.0
+// @version      1.3.0
 // @description  Export Sketchfab models to OBJ (static) or FBX (Maya-native rig+anim+skin) or glTF. Maya/Blender-ready: materials, textures, skeleton, skin weights, animations — nothing lost. Improved fork of SUR.
 // @author       Likolus
 // @match        https://sketchfab.com/*
@@ -35,9 +35,11 @@
  *    3. Links each material to its textures by:
  *         a) capturing the currently-bound GL texture at draw time, and
  *         b) name-prefix matching against the geometry's stateset name.
- *    4. Downloads textures from their ORIGINAL urls via
- *       GM_xmlhttpRequest — full resolution, correct orientation,
- *       original format (.jpg/.png/.jpeg). readPixels is only a fallback.
+ *    4. Captures texture pixels at the fullscreen drawArrays pass
+ *       (SUR-proven principle): readPixels while the texture is live,
+ *       then flips vertically + toBlob. Original-URL fetch via
+ *       GM_xmlhttpRequest is a secondary enhancement; readPixels-at-
+ *       export-time is only a last-resort fallback.
  *    5. Fixes the vertical-flip bug in the readPixels fallback path.
  *    6. Writes ONE combined model.obj with proper vertex/uv/normal
  *       index offsets per group (cleaner in DCC apps than N loose files).
@@ -61,12 +63,16 @@
     var capturedGeoIds = new Set();
 
     var textureStore = {};        // cleanUrl -> { name, type, url, ext, width, height }
-    var textureByCleanUrl = {};   // cleanUrl -> blob (filled at download time)
+    var textureByCleanUrl = {};   // cleanUrl -> blob (filled at draw time by drawhookimg)
     var capturedTextureSet = new Set();
+    var texCapturePending = new Set(); // cleanUrls currently being readPixels'd (dedup)
 
     // gl-texture-object -> metadata (built by texImage2D hook)
     var glTextureMeta = new Map();
     var glTextureIdx = 0;
+    // last-seen GL context (updated by texImage2D hook, used by attachbody
+    // to read the currently-bound texture without needing glCtx passed in)
+    var lastGLCtx = null;
 
     // ----------------------------- rig --------------------------------
     // Skeleton: bones captured from the viewer's scene graph.
@@ -248,7 +254,7 @@
     showUIWhenReady();
 
     // ---------------------- geometry capture -------------------------
-    // Called from injected patch: window.attachbody(t [, glCtx])
+    // Called from injected patch: window.attachbody(t)
     window.attachbody = function (t, glCtx) {
         try {
             if (geometries.length > 1000) return;
@@ -268,10 +274,12 @@
             if (uid) capturedGeoIds.add(uid);
 
             // try to grab currently-bound GL texture -> link material to texture
+            // (uses lastGLCtx captured by the texImage2D hook — no glCtx param needed)
             var boundTexUrl = null;
             try {
-                if (glCtx && glCtx.getParameter) {
-                    var bt = glCtx.getParameter(glCtx.TEXTURE_BINDING_2D);
+                var gl = lastGLCtx;
+                if (gl && gl.getParameter) {
+                    var bt = gl.getParameter(gl.TEXTURE_BINDING_2D);
                     if (bt && glTextureMeta.has(bt)) boundTexUrl = glTextureMeta.get(bt).cleanUrl;
                 }
             } catch (e) {}
@@ -349,25 +357,52 @@
     };
 
     // Called from injected patch: window.drawhookimg(t, image_data)
-    // (fullscreen pass — used as a secondary texture capture signal)
+    // SUR principle: at the fullscreen drawArrays(TRIANGLES,0,6) pass the
+    // source texture is bound & being rendered — readPixels NOW, while the
+    // pixels are live, and stash the blob. This is the reliable capture
+    // path (re-reading at export time gives broken/recycled pixels).
+    // NOTE: the caller passes (t, image_data) — so `gl` here IS the caller's
+    // `t` (the GL context), and `t` here IS `image_data` (t[5] = <img>).
     window.drawhookimg = function (gl, t) {
         try {
-            if (!t) return;
-            var url = t[5] && (t[5].currentSrc || t[5].src);
+            if (!gl || !t) return;
+            var imgEl = t[5];
+            if (!imgEl) return;
+            var url = imgEl.currentSrc || imgEl.src;
             if (!url) return;
             var cleanUrl = url.split('?')[0];
-            if (!textureStore[cleanUrl]) {
-                // we don't have metadata; register from the bound texture
-                var w = t[5].width, h = t[5].height;
-                textureStore[cleanUrl] = {
-                    name: uniqueTexName('texture', extFromUrl(url)),
-                    type: classifyTexture(cleanUrl),
-                    url: url, cleanUrl: cleanUrl, ext: extFromUrl(url),
-                    width: w, height: h
-                };
-                capturedTextureSet.add(cleanUrl);
-                status('Captured texture (pass): ' + textureStore[cleanUrl].name);
+            var meta = textureStore[cleanUrl];
+            if (!meta) return;                                   // only textures registered by drawhookcanvas
+            if (textureByCleanUrl[cleanUrl] || texCapturePending.has(cleanUrl)) return;
+            var width = imgEl.width || meta.width || 0;
+            var height = imgEl.height || meta.height || 0;
+            if (!width || !height) return;
+            var data;
+            try { data = new Uint8Array(width * height * 4); } catch (e) { return; }
+            try { gl.readPixels(0, 0, width, height, gl.RGBA, gl.UNSIGNED_BYTE, data); }
+            catch (e) { return; }
+            texCapturePending.add(cleanUrl);
+            // flip vertically so the PNG matches the original image orientation
+            var half = height / 2 | 0, bpr = width * 4, tmp = new Uint8Array(bpr);
+            for (var y = 0; y < half; y++) {
+                var top = y * bpr, bot = (height - y - 1) * bpr;
+                tmp.set(data.subarray(top, top + bpr));
+                data.copyWithin(top, bot, bot + bpr);
+                data.set(tmp, bot);
             }
+            var canvas = document.createElement('canvas');
+            canvas.width = width; canvas.height = height;
+            var ctx = canvas.getContext('2d');
+            var id = ctx.createImageData(width, height);
+            id.data.set(data);
+            ctx.putImageData(id, 0, 0);
+            canvas.toBlob(function (blob) {
+                texCapturePending.delete(cleanUrl);
+                if (blob) {
+                    textureByCleanUrl[cleanUrl] = blob;
+                    status('Captured texture pixels: ' + meta.name + ' (' + width + '×' + height + ')');
+                }
+            }, 'image/png');
         } catch (e) { dlog('drawhookimg error', e); }
     };
 
@@ -380,6 +415,7 @@
             var origTexImage = ctxProto.texImage2D;
             ctxProto.texImage2D = function () {
                 try {
+                    lastGLCtx = this;   // remember the live GL context for attachbody
                     var a = arguments;
                     var tex = this.getParameter(this.TEXTURE_BINDING_2D) || this.getParameter(this.TEXTURE_BINDING_CUBE_MAP);
                     if (tex) {
@@ -446,7 +482,6 @@
             if (!gl) return null;
             var w = meta.width, h = meta.height;
             if (!w || !h || w < 64 || h < 64) return null;
-            if ((w & (w - 1)) !== 0 || (h & (h - 1)) !== 0) return null;
             // find a texture object matching this url
             var tex = null;
             glTextureMeta.forEach(function (m, t) { if (m.cleanUrl === meta.cleanUrl) tex = t; });
@@ -490,10 +525,13 @@
         for (var i = 0; i < urls.length; i++) {
             var clean = urls[i];
             var meta = textureStore[clean];
-            var blob = null;
-            if (settings.fetchOriginalTextures && meta.url) {
+            // 1) already captured at draw time by drawhookimg (SUR principle)
+            var blob = textureByCleanUrl[clean];
+            // 2) enhancement: try the original URL via GM_xmlhttpRequest
+            if (!blob && settings.fetchOriginalTextures && meta.url) {
                 blob = await gmFetchBlob(meta.url);
             }
+            // 3) last resort: attach the GL texture to a framebuffer & readPixels
             if (!blob) {
                 var p = readPixelsFallback(meta, gl);
                 if (p) blob = await p;
@@ -1771,7 +1809,10 @@
             }
             if ((m = re_drawArrays.exec(js))) {
                 var i2 = m.index + m[0].length;
-                js = js.slice(0, i2) + ',window.drawhookimg(gl,t)' + js.slice(i2);
+                // SUR-proven: `t` is the GL context, `image_data` is the 4th param
+                // added by the renderInto2 patch. MUST use these names — `gl` is
+                // NOT in scope here (older builds used `gl`, now it's `t`).
+                js = js.slice(0, i2) + ',window.drawhookimg(t,image_data)' + js.slice(i2);
                 console.log('[LikolusExport] patch drawArrays ok');
             }
             if ((m = re_getResourceImage.exec(js))) {
@@ -1781,8 +1822,9 @@
             }
             if ((m = re_drawGeometry.exec(js))) {
                 var i4 = m.index + m[1].length;
-                // pass graphicContext too so we can read the bound texture
-                js = js.slice(0, i4) + ';window.attachbody(t,this._graphicContext);' + js.slice(i4);
+                // SUR-proven injection (no second arg); attachbody reads the
+                // bound texture via lastGLCtx captured by the texImage2D hook
+                js = js.slice(0, i4) + ';window.attachbody(t);' + js.slice(i4);
                 console.log('[LikolusExport] patch drawGeometry ok');
             }
 
