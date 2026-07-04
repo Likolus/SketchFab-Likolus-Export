@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         SketchFab Likolus Export
 // @namespace    https://github.com/Likolus
-// @version      1.3.0
+// @version      1.3.1
 // @description  Export Sketchfab models to OBJ (static) or FBX (Maya-native rig+anim+skin) or glTF. Maya/Blender-ready: materials, textures, skeleton, skin weights, animations — nothing lost. Improved fork of SUR.
 // @author       Likolus
 // @match        https://sketchfab.com/*
@@ -151,6 +151,22 @@
         candidate = safe + '_' + i + '.' + (ext || 'png');
         usedTexNames[candidate] = 1;
         return candidate;
+    }
+
+    // Force a texture's filename to .png when its blob is PNG-encoded
+    // (from readPixels). This is CRITICAL for OBJ+MTL: Maya's map_Kd loader
+    // picks the decoder by FILE EXTENSION, so a .jpg-named file containing
+    // PNG data renders as a broken texture. FBX sniffs the format from magic
+    // bytes and tolerates the mismatch — which is why FBX worked but OBJ did
+    // not. gmFetchBlob fetches the original bytes (real jpg/png) so its name
+    // already matches; only readPixels-captured blobs need this fix.
+    function forcePngExtension(meta) {
+        try {
+            if (!meta || meta.ext === 'png') return;
+            var base = (meta.name || 'texture').replace(/\.(png|jpg|jpeg|webp|tga|bmp|ktx2)$/i, '');
+            meta.ext = 'png';
+            meta.name = uniqueTexName(base, 'png');
+        } catch (e) { dlog('forcePngExtension error', e); }
     }
 
     // --------------------------- settings ----------------------------
@@ -399,6 +415,10 @@
             canvas.toBlob(function (blob) {
                 texCapturePending.delete(cleanUrl);
                 if (blob) {
+                    // blob is PNG-encoded (readPixels → toBlob 'image/png');
+                    // fix the filename so .jpg/.webp names don't carry PNG
+                    // content (breaks Maya OBJ map_Kd which keys off ext).
+                    forcePngExtension(meta);
                     textureByCleanUrl[cleanUrl] = blob;
                     status('Captured texture pixels: ' + meta.name + ' (' + width + '×' + height + ')');
                 }
@@ -503,7 +523,12 @@
             }
             var canvas = document.createElement('canvas'); canvas.width = w; canvas.height = h;
             var ctx = canvas.getContext('2d'); var id = ctx.createImageData(w, h); id.data.set(pixels); ctx.putImageData(id, 0, 0);
-            return new Promise(function (res) { canvas.toBlob(function (b) { res(b); }, 'image/png'); });
+            return new Promise(function (res) {
+                canvas.toBlob(function (b) {
+                    if (b) forcePngExtension(meta);   // readPixels → PNG, fix ext
+                    res(b);
+                }, 'image/png');
+            });
         } catch (e) { return null; }
     }
 
