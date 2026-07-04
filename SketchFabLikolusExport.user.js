@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         SketchFab Likolus Export
 // @namespace    https://github.com/Likolus
-// @version      1.1.0
-// @description  Export Sketchfab models to OBJ with correctly mapped materials & textures. Maya/Blender-ready: nothing lost, texture paths preserved. Improved fork of SUR (WulfSkol/gamedev44).
+// @version      1.2.0
+// @description  Export Sketchfab models to OBJ (static) or FBX (Maya-native rig+anim+skin) or glTF. Maya/Blender-ready: materials, textures, skeleton, skin weights, animations — nothing lost. Improved fork of SUR.
 // @author       Likolus
 // @match        https://sketchfab.com/*
 // @include      /^https?://(www\.)?sketchfab\.com/.*$/
@@ -149,13 +149,13 @@
 
     // --------------------------- settings ----------------------------
     var settings = {
-        format: 'obj',       // 'obj' | 'gltf'
+        format: 'obj',       // 'obj' (static) | 'fbx' (Maya rig) | 'gltf' (Blender rig)
         texturesOnly: false,
         scale: 1.0,
         flipUV: false,       // flip V (1-v) for UVs — off by default
         combineObj: true,    // single model.obj with groups
         fetchOriginalTextures: true,
-        rig: false           // capture skeleton + skin weights + animations (forces glTF)
+        rig: false           // capture skeleton + skin weights + animations (forces FBX/glTF)
     };
 
     // --------------------------- UI ----------------------------------
@@ -179,13 +179,14 @@
               '</div>' +
               '<div style="border-top:1px solid #2a2f37;padding-top:10px;margin-bottom:8px;">' +
                 '<div style="color:#8b949e;font-size:11px;margin-bottom:4px;">Format</div>' +
-                '<label style="display:block;margin:2px 0;cursor:pointer;"><input type="radio" name="lkx-fmt" value="obj" checked> <b style="color:#e8eaed;">OBJ + MTL + Textures</b> <span style="color:#8b949e;">(Maya/Blender)</span></label>' +
+                '<label style="display:block;margin:2px 0;cursor:pointer;"><input type="radio" name="lkx-fmt" value="obj" checked> <b style="color:#e8eaed;">OBJ + MTL</b> <span style="color:#8b949e;">(static, no rig)</span></label>' +
+                '<label style="display:block;margin:2px 0;cursor:pointer;color:#8b949e;"><input type="radio" name="lkx-fmt" value="fbx"> <b style="color:#f0883e;">FBX</b> <span style="color:#8b949e;">(Maya — rig + anim + skin)</span></label>' +
                 '<label style="display:block;margin:2px 0;cursor:pointer;color:#8b949e;"><input type="radio" name="lkx-fmt" value="gltf"> GLTF + .bin</label>' +
               '</div>' +
               '<div style="display:flex;gap:8px;margin-bottom:8px;">' +
                 '<label style="flex:1;color:#8b949e;font-size:11px;">Scale<br><input type="number" id="lkx-scale" value="1.0" step="0.1" style="width:100%;box-sizing:border-box;background:#0d1117;color:#e8eaed;border:1px solid #2a2f37;border-radius:4px;padding:3px 5px;"></label>' +
                 '<label style="flex:1;color:#8b949e;font-size:11px;display:flex;flex-direction:column;">Options<br>' +
-                  '<span style="margin-top:2px;"><input type="checkbox" id="lkx-rig"> Rig + Anim <span style="color:#d2a8ff;">(glTF)</span></span>' +
+                  '<span style="margin-top:2px;"><input type="checkbox" id="lkx-rig"> Rig + Anim <span style="color:#f0883e;">(FBX)</span></span>' +
                   '<span><input type="checkbox" id="lkx-flipuv"> Flip UV V</span>' +
                   '<span><input type="checkbox" id="lkx-texonly"> Textures only</span>' +
                 '</label>' +
@@ -212,11 +213,11 @@
             var rg = document.getElementById('lkx-rig'); if (rg) rg.addEventListener('change', function (e) {
                 settings.rig = e.target.checked;
                 if (settings.rig) {
-                    // rig requires glTF; switch format radio + setting
-                    settings.format = 'gltf';
+                    // rig requires FBX (Maya-native) or glTF; default to FBX
+                    settings.format = 'fbx';
                     var ob = document.querySelector('input[name="lkx-fmt"][value="obj"]');
-                    var gl = document.querySelector('input[name="lkx-fmt"][value="gltf"]');
-                    if (ob) ob.checked = false; if (gl) gl.checked = true;
+                    var fb = document.querySelector('input[name="lkx-fmt"][value="fbx"]');
+                    if (ob) ob.checked = false; if (fb) fb.checked = true;
                 }
             });
         }, 50);
@@ -1129,6 +1130,476 @@
         return { json: JSON.stringify(gltf, null, 2), bin: new Blob(binParts, { type: 'application/octet-stream' }) };
     }
 
+    // -------------------------- FBX writer ---------------------------
+    // FBX ASCII 7.4 (Maya-native interchange). Carries skeleton, skin
+    // weights and animations — none of which OBJ can represent.
+    // Maya imports FBX natively (no plugin). Blender also imports FBX.
+    function quatToEulerXYZDeg(qx, qy, qz, qw) {
+        var sinr_cosp = 2 * (qw * qx + qy * qz);
+        var cosr_cosp = 1 - 2 * (qx * qx + qy * qy);
+        var roll = Math.atan2(sinr_cosp, cosr_cosp);
+        var sinp = 2 * (qw * qy - qz * qx);
+        var pitch;
+        if (Math.abs(sinp) >= 1) pitch = (sinp > 0 ? 1 : -1) * Math.PI / 2;
+        else pitch = Math.asin(sinp);
+        var siny_cosp = 2 * (qw * qz + qx * qy);
+        var cosy_cosp = 1 - 2 * (qy * qy + qz * qz);
+        var yaw = Math.atan2(siny_cosp, cosy_cosp);
+        var RAD = 180 / Math.PI;
+        return [roll * RAD, pitch * RAD, yaw * RAD];
+    }
+
+    function invertMat4(m) {
+        var a00=m[0],a01=m[4],a02=m[8],a03=m[12];
+        var a10=m[1],a11=m[5],a12=m[9],a13=m[13];
+        var a20=m[2],a21=m[6],a22=m[10],a23=m[14];
+        var a30=m[3],a31=m[7],a32=m[11],a33=m[15];
+        var b00=a00*a11-a10*a01, b01=a00*a21-a20*a01, b02=a00*a31-a30*a01;
+        var b03=a10*a21-a20*a11, b04=a10*a31-a30*a11, b05=a20*a31-a30*a21;
+        var b06=a02*a13-a12*a03, b07=a02*a23-a22*a03, b08=a02*a33-a32*a03;
+        var b09=a12*a23-a22*a13, b10=a12*a33-a32*a13, b11=a22*a33-a32*a23;
+        var det = b00*b11-b01*b10+b02*b09+b03*b08-b04*b07+b05*b06;
+        if (!det || !isFinite(det)) return null;
+        var inv = 1.0/det;
+        var r = new Float32Array(16);
+        r[0]=(a11*b11-a21*b10+a31*b09)*inv;
+        r[1]=(-a10*b11+a20*b10-a30*b09)*inv;
+        r[2]=(a13*b05-a23*b04+a33*b03)*inv;
+        r[3]=(-a12*b05+a22*b04-a32*b03)*inv;
+        r[4]=(-a01*b11+a21*b08-a31*b07)*inv;
+        r[5]=(a00*b11-a20*b08+a30*b07)*inv;
+        r[6]=(-a03*b05+a23*b02-a33*b01)*inv;
+        r[7]=(a02*b05-a22*b02+a32*b01)*inv;
+        r[8]=(a01*b10-a11*b08+a31*b06)*inv;
+        r[9]=(-a00*b10+a10*b08-a30*b06)*inv;
+        r[10]=(a03*b04-a13*b02+a33*b00)*inv;
+        r[11]=(-a02*b04+a12*b02-a32*b00)*inv;
+        r[12]=(-a01*b09+a11*b07-a21*b06)*inv;
+        r[13]=(a00*b09-a10*b07+a20*b06)*inv;
+        r[14]=(-a03*b03+a13*b01-a23*b00)*inv;
+        r[15]=(a02*b03-a12*b01+a22*b00)*inv;
+        return r;
+    }
+
+    // wrap a long array across multiple lines (FBX parsers accept newlines inside a:)
+    function fmtLong(vals, perLine) {
+        perLine = perLine || 240;
+        if (vals.length <= perLine) return vals.join(',');
+        var chunks = [];
+        for (var i = 0; i < vals.length; i += perLine) chunks.push(vals.slice(i, i+perLine).join(','));
+        return chunks.join(',\n\t\t\t');
+    }
+
+    function buildFBX(modelName) {
+        var nextId = 1000;
+        function nid() { return nextId++; }
+        var out = [];
+        function L(s) { out.push(s); }
+
+        var materials = buildMaterials();
+        var ident = [1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1];
+
+        // expand primitive indices into a flat polygon-vertex vertex-index list (3 per triangle)
+        function expandPV(g) {
+            var r = [];
+            g.primitives.forEach(function (p) {
+                var idx = p.indices, mode = p.mode;
+                if (mode === 4 || mode === undefined) {
+                    for (var j = 0; j+2 < idx.length; j += 3) r.push(idx[j], idx[j+1], idx[j+2]);
+                } else if (mode === 5) {
+                    for (var j = 0; j+2 < idx.length; j++) {
+                        var a=idx[j],b=idx[j+1],c=idx[j+2];
+                        if (j & 1) { var t=b; b=c; c=t; }
+                        r.push(a,b,c);
+                    }
+                } else if (mode === 6) {
+                    for (var j = 1; j+1 < idx.length; j++) r.push(idx[0], idx[j], idx[j+1]);
+                }
+            });
+            return r;
+        }
+
+        // ---- allocate unique IDs ----
+        var meshGeoIds = [], meshModelIds = [];
+        geometries.forEach(function () { meshGeoIds.push(nid()); meshModelIds.push(nid()); });
+        var boneModelIds = rigBones.map(function () { return nid(); });
+        var matIds = materials.map(function () { return nid(); });
+        var videoIds = {}, texIdsByKey = {};
+        materials.forEach(function (m) {
+            var seen = {};
+            ['albedo','normal','roughness','metallic','emissive','occlusion','specular','opacity'].forEach(function (ty) {
+                var t = m.slots[ty]; if (!t || seen[t.cleanUrl]) return; seen[t.cleanUrl] = 1;
+                if (!videoIds[t.cleanUrl]) videoIds[t.cleanUrl] = nid();
+                texIdsByKey[m.name + '_' + ty] = nid();
+            });
+        });
+        var skinIds = {}, clusterIds = {};
+        Object.keys(rigSkinByGeoIdx).forEach(function (gi) {
+            skinIds[gi] = nid();
+            rigSkinByGeoIdx[gi].joints.forEach(function (jb) { clusterIds[gi + '_' + jb] = nid(); });
+        });
+        var stackIds = [], layerIds = [];
+        rigAnimations.forEach(function () { stackIds.push(nid()); layerIds.push(nid()); });
+
+        var nModel = geometries.length + rigBones.length;
+        var nGeo = geometries.length;
+        var nMat = materials.length;
+        var nVid = Object.keys(videoIds).length;
+        var nTex = Object.keys(texIdsByKey).length;
+        var nDef = Object.keys(skinIds).length + Object.keys(clusterIds).length;
+        var nStack = rigAnimations.length;
+
+        // ---- header ----
+        L('; FBX 7.4.0 project file');
+        L('; Generated by SketchFab Likolus Export');
+        L('FBXHeaderExtension:  {');
+        L('\tFBXHeaderVersion: 1003');
+        L('\tFBXVersion: 7400');
+        L('\tCreationTimeStamp:  {');
+        L('\t\tVersion: 1000');
+        var d = new Date();
+        L('\t\tYear: ' + d.getFullYear());
+        L('\t\tMonth: ' + (d.getMonth()+1));
+        L('\t\tDay: ' + d.getDate());
+        L('\t\tHour: ' + d.getHours());
+        L('\t\tMinute: ' + d.getMinutes());
+        L('\t\tSecond: ' + d.getSeconds());
+        L('\t\tMillisecond: ' + d.getMilliseconds());
+        L('\t}');
+        L('\tCreator: "SketchFab Likolus Export"');
+        L('}');
+        L('GlobalSettings:  {');
+        L('\tVersion: 1000');
+        L('\tProperties70:  {');
+        L('\t\tP: "UpAxis", "int", "Integer", "",1');
+        L('\t\tP: "UpAxisSign", "int", "Integer", "",1');
+        L('\t\tP: "FrontAxis", "int", "Integer", "",2');
+        L('\t\tP: "FrontAxisSign", "int", "Integer", "",1');
+        L('\t\tP: "CoordAxis", "int", "Integer", "",0');
+        L('\t\tP: "CoordAxisSign", "int", "Integer", "",1');
+        L('\t\tP: "OriginalUpAxis", "int", "Integer", "",1');
+        L('\t\tP: "OriginalUnitScaleFactor", "double", "Number", "",1');
+        L('\t\tP: "UnitScaleFactor", "double", "Number", "",1');
+        L('\t}');
+        L('}');
+
+        // ---- Definitions ----
+        var defCount = 2 + nModel + nGeo + nMat + nVid + nTex + nDef + (nStack ? nStack*2 : 0);
+        L('Definitions:  {');
+        L('\tVersion: 100');
+        L('\tCount: ' + defCount);
+        L('\tObjectType: "GlobalSettings" {'); L('\t\tCount: 1'); L('\t}');
+        L('\tObjectType: "Model" {'); L('\t\tCount: ' + nModel); L('\t}');
+        L('\tObjectType: "Geometry" {'); L('\t\tCount: ' + nGeo); L('\t}');
+        if (nMat) { L('\tObjectType: "Material" {'); L('\t\tCount: ' + nMat); L('\t}'); }
+        if (nVid) { L('\tObjectType: "Video" {'); L('\t\tCount: ' + nVid); L('\t}'); }
+        if (nTex) { L('\tObjectType: "Texture" {'); L('\t\tCount: ' + nTex); L('\t}'); }
+        if (nDef) { L('\tObjectType: "Deformer" {'); L('\t\tCount: ' + nDef); L('\t}'); }
+        if (nStack) {
+            L('\tObjectType: "AnimationStack" {'); L('\t\tCount: ' + nStack); L('\t}');
+            L('\tObjectType: "AnimationLayer" {'); L('\t\tCount: ' + nStack); L('\t}');
+        }
+        L('}');
+
+        // ---- Objects ----
+        L('Objects:  {');
+
+        // Geometry + skin + clusters + mesh Model per geometry
+        geometries.forEach(function (g, i) {
+            var pv = expandPV(g);
+            L('\tGeometry: ' + meshGeoIds[i] + ', "Geometry::' + g.name + '", "Mesh" {');
+            // Vertices
+            L('\t\tVertices: *' + g.vertex.length + ' {');
+            var vv = [];
+            for (var vi = 0; vi < g.vertex.length; vi += 3) {
+                vv.push(fnum(g.vertex[vi]*settings.scale) + ',' + fnum(g.vertex[vi+1]*settings.scale) + ',' + fnum(g.vertex[vi+2]*settings.scale));
+            }
+            L('\t\ta: ' + fmtLong(vv));
+            L('\t}');
+            // PolygonVertexIndex (negate last index of each triangle)
+            L('\t\tPolygonVertexIndex: *' + pv.length + ' {');
+            var pvi = [];
+            for (var p = 0; p < pv.length; p += 3) pvi.push(pv[p] + ',' + pv[p+1] + ',' + (-(pv[p+2]+1)));
+            L('\t\ta: ' + fmtLong(pvi));
+            L('\t}');
+            // Normals (ByPolygonVertex Direct — one per polygon-vertex)
+            if (g.normal && g.normal.length) {
+                L('\t\tLayerElementNormal: 0 {');
+                L('\t\t\tVersion: 101');
+                L('\t\t\tName: ""');
+                L('\t\t\tMappingInformationType: "ByPolygonVertex"');
+                L('\t\t\tReferenceInformationType: "Direct"');
+                var nn = [];
+                for (var p = 0; p < pv.length; p++) {
+                    var ni = pv[p]*3;
+                    nn.push(fnum(g.normal[ni]||0) + ',' + fnum(g.normal[ni+1]||0) + ',' + fnum(g.normal[ni+2]||0));
+                }
+                L('\t\t\tNormals: *' + (pv.length*3) + ' {');
+                L('\t\t\ta: ' + fmtLong(nn));
+                L('\t\t}');
+                L('\t\t}');
+            }
+            // UVs (ByPolygonVertex IndexToDirect — UVs are vertex-indexed in our data)
+            if (g.uv && g.uv.length) {
+                L('\t\tLayerElementUV: 0 {');
+                L('\t\t\tVersion: 101');
+                L('\t\t\tName: "map1"');
+                L('\t\t\tMappingInformationType: "ByPolygonVertex"');
+                L('\t\t\tReferenceInformationType: "IndexToDirect"');
+                var uu = [];
+                for (var ui = 0; ui < g.uv.length; ui += 2) {
+                    var uU = g.uv[ui], vV = g.uv[ui+1];
+                    if (settings.flipUV) vV = 1 - vV;
+                    uu.push(fnum(uU) + ',' + fnum(vV));
+                }
+                L('\t\t\tUV: *' + g.uv.length + ' {');
+                L('\t\t\ta: ' + fmtLong(uu));
+                L('\t\t}');
+                L('\t\t\tUVIndex: *' + pv.length + ' {');
+                L('\t\t\ta: ' + fmtLong(pv));
+                L('\t\t}');
+                L('\t\t}');
+            }
+            // Material (AllSame — one material per geometry)
+            L('\t\tLayerElementMaterial: 0 {');
+            L('\t\t\tVersion: 101');
+            L('\t\t\tName: ""');
+            L('\t\t\tMappingInformationType: "AllSame"');
+            L('\t\t\tReferenceInformationType: "IndexToDirect"');
+            L('\t\t\tMaterials: *1 {'); L('\t\t\ta: 0'); L('\t\t}');
+            L('\t\t}');
+            L('\t\tLayer: 0 {');
+            L('\t\t\tVersion: 100');
+            if (g.normal && g.normal.length) { L('\t\t\tLayerElement:  {'); L('\t\t\t\tType: "LayerElementNormal"'); L('\t\t\t\tTypedIndex: 0'); L('\t\t\t}'); }
+            if (g.uv && g.uv.length) { L('\t\t\tLayerElement:  {'); L('\t\t\t\tType: "LayerElementUV"'); L('\t\t\t\tTypedIndex: 0'); L('\t\t\t}'); }
+            L('\t\t\tLayerElement:  {'); L('\t\t\t\tType: "LayerElementMaterial"'); L('\t\t\t\tTypedIndex: 0'); L('\t\t\t}');
+            L('\t\t}');
+            L('\t}'); // end Geometry
+
+            // Skin deformer + per-bone clusters
+            if (skinIds[i]) {
+                var skinObj = rigSkinByGeoIdx[i];
+                L('\tDeformer: ' + skinIds[i] + ', "Deformer::Skin_' + g.name + '", "Skin" {');
+                L('\t\tVersion: 101');
+                L('\t\tLink_DeformAcuracy: 4.5');
+                L('\t}');
+                var vcount = g.vertex.length / 3;
+                var ja = skinObj.jointAttr, wa = skinObj.weightAttr;
+                var perVert = (ja.length / vcount) | 0; if (perVert < 1) perVert = 4;
+                skinObj.joints.forEach(function (jb) {
+                    var bone = rigBones[jb]; if (!bone) return;
+                    var cid = clusterIds[i + '_' + jb];
+                    var idxs = [], wts = [];
+                    for (var vv2 = 0; vv2 < vcount; vv2++) {
+                        for (var c = 0; c < perVert; c++) {
+                            var srcIdx = vv2 * perVert + c;
+                            var jv = (srcIdx < ja.length ? (ja[srcIdx] | 0) : 0);
+                            var mapped = (jv < skinObj.joints.length) ? skinObj.joints[jv] : 0;
+                            var wv = (srcIdx < wa.length ? wa[srcIdx] : 0);
+                            if (mapped === jb && wv > 0) { idxs.push(vv2); wts.push(wv); }
+                        }
+                    }
+                    L('\tDeformer: ' + cid + ', "Deformer::Cluster_' + bone.name + '", "Cluster" {');
+                    L('\t\tVersion: 100');
+                    L('\t\tIndexes: *' + idxs.length + ' {'); L('\t\t\ta: ' + fmtLong(idxs)); L('\t\t}');
+                    var wstr = wts.map(fnum);
+                    L('\t\tWeights: *' + wts.length + ' {'); L('\t\t\ta: ' + fmtLong(wstr)); L('\t\t}');
+                    // Transform = ibm (mesh-local -> bone-local at bind). TransformLink = inverse(ibm) = bone world bind.
+                    var transform = ident, transformLink = ident;
+                    if (bone.ibm) {
+                        transform = Array.prototype.slice.call(bone.ibm);
+                        var inv = invertMat4(bone.ibm);
+                        if (inv) transformLink = Array.prototype.slice.call(inv);
+                    }
+                    L('\t\tTransform: ' + transform.join(','));
+                    L('\t\tTransformLink: ' + transformLink.join(','));
+                    L('\t}');
+                });
+            }
+
+            // Mesh Model node
+            L('\tModel: ' + meshModelIds[i] + ', "Model::' + g.name + '", "Mesh" {');
+            L('\t\tVersion: 232');
+            L('\t\tProperties70:  {');
+            L('\t\t\tP: "RotationActive", "bool", "", "",1');
+            L('\t\t}');
+            L('\t}');
+        });
+
+        // Bone Model nodes (LimbNode) with local TRS
+        rigBones.forEach(function (bone, bi) {
+            var e = quatToEulerXYZDeg(bone.rotation[0], bone.rotation[1], bone.rotation[2], bone.rotation[3]);
+            L('\tModel: ' + boneModelIds[bi] + ', "Model::' + bone.name + '", "LimbNode" {');
+            L('\t\tVersion: 232');
+            L('\t\tProperties70:  {');
+            L('\t\t\tP: "RotationActive", "bool", "", "",1');
+            L('\t\t\tP: "RotationOrder", "int", "Integer", "",0');
+            L('\t\t\tP: "Lcl Translation", "Lcl Translation", "", "A",' + fnum(bone.translation[0]) + ',' + fnum(bone.translation[1]) + ',' + fnum(bone.translation[2]));
+            L('\t\t\tP: "Lcl Rotation", "Lcl Rotation", "", "A",' + fnum(e[0]) + ',' + fnum(e[1]) + ',' + fnum(e[2]));
+            L('\t\t\tP: "Lcl Scaling", "Lcl Scaling", "", "A",' + fnum(bone.scale[0]) + ',' + fnum(bone.scale[1]) + ',' + fnum(bone.scale[2]));
+            L('\t\t}');
+            L('\t}');
+        });
+
+        // Materials
+        materials.forEach(function (m, mi) {
+            L('\tMaterial: ' + matIds[mi] + ', "Material::' + m.name + '", "" {');
+            L('\t\tVersion: 102');
+            L('\t\tShadingModel: "phong"');
+            L('\t\tMultiLayer: 0');
+            L('\t\tProperties70:  {');
+            L('\t\t\tP: "ShadingModel", "KString", "", "", "phong"');
+            L('\t\t\tP: "DiffuseColor", "Color", "", "A",1,1,1');
+            L('\t\t\tP: "SpecularColor", "Color", "", "A",0.04,0.04,0.04');
+            L('\t\t\tP: "Shininess", "double", "Number", "",8');
+            L('\t\t}');
+            L('\t}');
+        });
+
+        // Videos (image clips)
+        Object.keys(videoIds).forEach(function (cu) {
+            var t = textureStore[cu]; if (!t) return;
+            L('\tVideo: ' + videoIds[cu] + ', "Video::' + t.name + '", "Clip" {');
+            L('\t\tType: "Clip"');
+            L('\t\tProperties70:  {');
+            L('\t\t\tP: "Path", "KString", "XRefUrl", "", "textures/' + t.name + '"');
+            L('\t\t}');
+            L('\t\tUseMipMap: 0');
+            L('\t\tFilename: "textures/' + t.name + '"');
+            L('\t\tRelativeFilename: "textures/' + t.name + '"');
+            L('\t}');
+        });
+
+        // Textures (one per material slot)
+        materials.forEach(function (m) {
+            ['albedo','normal','roughness','metallic','emissive','occlusion','specular','opacity'].forEach(function (ty) {
+                var t = m.slots[ty]; if (!t) return;
+                var tid = texIdsByKey[m.name + '_' + ty]; if (!tid) return;
+                L('\tTexture: ' + tid + ', "Texture::' + t.name + '", "" {');
+                L('\t\tType: "TextureVideoClip"');
+                L('\t\tVersion: 202');
+                L('\t\tTextureName: "Texture::' + t.name + '"');
+                L('\t\tProperties70:  {');
+                L('\t\t\tP: "CurrentTextureBlendMode", "enum", "", "",0');
+                L('\t\t}');
+                L('\t\tMedia: "Video::' + t.name + '"');
+                L('\t\tFileName: "textures/' + t.name + '"');
+                L('\t\tRelativeFilename: "textures/' + t.name + '"');
+                L('\t}');
+            });
+        });
+
+        // Animation stacks, layers, curve nodes, curves
+        var curveNodes = [], curves = [];
+        rigAnimations.forEach(function (anim, ai) {
+            L('\tAnimationStack: ' + stackIds[ai] + ', "AnimStack::' + anim.name + '" {');
+            L('\t\tProperties70:  {');
+            var stopTicks = Math.round((anim.duration || 0) * 46186158000);
+            L('\t\t\tP: "LocalStop", "KTime", "Time", "",' + stopTicks);
+            L('\t\t}');
+            L('\t}');
+            L('\tAnimationLayer: ' + layerIds[ai] + ', "AnimLayer::' + anim.name + '" {');
+            L('\t\tWeight: 100'); L('\t\tMute: 0'); L('\t\tSolo: 0'); L('\t\tLock: 0');
+            L('\t\tColor:  {'); L('\t\t\ta: 0.8,0.8,0.8'); L('\t\t}');
+            L('\t}');
+            anim.channels.forEach(function (ch) {
+                var tgt = boneModelIds[ch.boneIdx]; if (!tgt) return;
+                var isRot = ch.path === 'rotation';
+                var srcStride = isRot ? 4 : 3;
+                var propName = ch.path === 'translation' ? 'Lcl Translation' : (ch.path === 'rotation' ? 'Lcl Rotation' : 'Lcl Scaling');
+                var cnId = nid();
+                L('\tAnimationCurveNode: ' + cnId + ', "AnimCurveNode::' + propName + '" {');
+                L('\t\tProperties70:  {');
+                L('\t\t\tP: "d|X", "Compound", "", "A",0');
+                L('\t\t\tP: "d|Y", "Compound", "", "A",0');
+                L('\t\t\tP: "d|Z", "Compound", "", "A",0');
+                L('\t\t}');
+                L('\t}');
+                curveNodes.push({ id: cnId, layerId: layerIds[ai], modelId: tgt, propName: propName });
+                // pre-convert rotation quaternions to Euler degrees
+                var eu = null;
+                if (isRot) {
+                    eu = [];
+                    for (var k = 0; k < ch.times.length; k++) {
+                        eu.push(quatToEulerXYZDeg(ch.values[k*4], ch.values[k*4+1], ch.values[k*4+2], ch.values[k*4+3]));
+                    }
+                }
+                ['X','Y','Z'].forEach(function (comp, ci) {
+                    var cvId = nid();
+                    var kt = [], kv = [], def = 0;
+                    for (var k = 0; k < ch.times.length; k++) {
+                        var tt = Math.round(ch.times[k] * 46186158000);
+                        var val = isRot ? eu[k][ci] : ch.values[k*srcStride + ci];
+                        if (k === 0) def = val;
+                        kt.push(tt);
+                        kv.push(fnum(val));
+                    }
+                    L('\tAnimationCurve: ' + cvId + ' {');
+                    L('\t\tDefault: ' + fnum(def));
+                    L('\t\tKeyVer: 4000');
+                    L('\t\tKeyTime: *' + kt.length + ' {'); L('\t\t\ta: ' + fmtLong(kt)); L('\t\t}');
+                    L('\t\tKeyValueFloat: *' + kv.length + ' {'); L('\t\t\ta: ' + fmtLong(kv)); L('\t\t}');
+                    L('\t}');
+                    curves.push({ id: cvId, nodeId: cnId, comp: comp });
+                });
+            });
+        });
+
+        L('}'); // end Objects
+
+        // ---- Connections ----
+        L('Connections:  {');
+        // geometry -> model, material -> model
+        geometries.forEach(function (g, i) {
+            L('\tC: "OO",' + meshGeoIds[i] + ',' + meshModelIds[i]);
+            if (matIds[i]) L('\tC: "OO",' + matIds[i] + ',' + meshModelIds[i]);
+        });
+        // texture -> material (OP), video -> texture (OO)
+        var propMap = {albedo:'DiffuseColor',normal:'NormalMap',roughness:'Roughness',metallic:'Metallic',emissive:'Emissive',occlusion:'AmbientColor',specular:'SpecularColor',opacity:'TransparentColor'};
+        materials.forEach(function (m, mi) {
+            ['albedo','normal','roughness','metallic','emissive','occlusion','specular','opacity'].forEach(function (ty) {
+                var t = m.slots[ty]; if (!t) return;
+                var tid = texIdsByKey[m.name + '_' + ty]; if (!tid) return;
+                L('\tC: "OP",' + tid + ',' + matIds[mi] + ',"' + propMap[ty] + '"');
+                if (videoIds[t.cleanUrl]) L('\tC: "OO",' + videoIds[t.cleanUrl] + ',' + tid);
+            });
+        });
+        // bone hierarchy
+        rigBones.forEach(function (bone, bi) {
+            if (!bone.parentRef) return;
+            for (var k = 0; k < rigBones.length; k++) {
+                if (rigBones[k].ref === bone.parentRef) {
+                    L('\tC: "OO",' + boneModelIds[bi] + ',' + boneModelIds[k]);
+                    break;
+                }
+            }
+        });
+        // skin -> geometry, cluster -> skin, cluster -> bone
+        Object.keys(rigSkinByGeoIdx).forEach(function (gi) {
+            var skinObj = rigSkinByGeoIdx[gi];
+            L('\tC: "OO",' + skinIds[gi] + ',' + meshGeoIds[gi]);
+            skinObj.joints.forEach(function (jb) {
+                var cid = clusterIds[gi + '_' + jb];
+                L('\tC: "OO",' + cid + ',' + skinIds[gi]);
+                if (boneModelIds[jb]) L('\tC: "OO",' + cid + ',' + boneModelIds[jb]);
+            });
+        });
+        // animation: layer -> stack, curveNode -> layer, curveNode -> model property, curve -> curveNode component
+        rigAnimations.forEach(function (anim, ai) {
+            L('\tC: "OO",' + layerIds[ai] + ',' + stackIds[ai]);
+        });
+        curveNodes.forEach(function (cn) {
+            L('\tC: "OO",' + cn.id + ',' + cn.layerId);
+            L('\tC: "OP",' + cn.id + ',' + cn.modelId + ',"' + cn.propName + '"');
+        });
+        curves.forEach(function (cv) {
+            L('\tC: "OP",' + cv.id + ',' + cv.nodeId + ',"d|' + cv.comp + '"');
+        });
+        L('}');
+
+        return { ascii: out.join('\n') + '\n' };
+    }
+
     // --------------------------- metadata ----------------------------
     function getMetadata() {
         var md = { name: 'sketchfab_model', author: 'unknown', url: window.location.href, date: new Date().toISOString(), id: getModelIdFromPath() };
@@ -1157,9 +1628,9 @@
             var root = zip.folder(modelName);
 
             if (!settings.texturesOnly) {
-                // rig requires glTF (OBJ can't carry skeleton/skin/animation)
-                if (settings.rig) {
-                    settings.format = 'gltf';
+                // rig requires FBX (Maya) or glTF; OBJ can't carry skeleton/skin/animation
+                if (settings.rig && settings.format === 'obj') settings.format = 'fbx';
+                if (settings.format === 'fbx' || settings.format === 'gltf' || settings.rig) {
                     setMsg('Capturing animations…'); setProgress(2);
                     captureAnimations();
                 }
@@ -1178,6 +1649,17 @@
                     setMsg('Writing MTL…'); setProgress(80);
                     var mtlBlob = buildMtl(modelName, materials);
                     root.file(modelName + '.mtl', mtlBlob);
+                } else if (settings.format === 'fbx') {
+                    setMsg('Fetching textures for FBX…'); setProgress(5);
+                    await fetchAllTextures(function (done, total, nm) {
+                        setProgress(5 + Math.round((done / total) * 60));
+                        setMsg('Texture ' + done + '/' + total + ': ' + nm);
+                    });
+                    setMsg('Writing FBX (Maya — rig + anim + skin)…'); setProgress(72);
+                    var fbx = buildFBX(modelName);
+                    root.file(modelName + '.fbx', fbx.ascii);
+                    setProgress(85);
+                    setMsg('FBX ready: ' + rigBones.length + ' bones, ' + rigAnimations.length + ' anim(s), ' + geometries.length + ' mesh(es)');
                 } else {
                     setMsg('Fetching textures for GLTF…'); setProgress(5);
                     await fetchAllTextures(function (done, total, nm) {
