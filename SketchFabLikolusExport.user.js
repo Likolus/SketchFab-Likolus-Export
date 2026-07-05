@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         SketchFab Likolus Export
 // @namespace    https://github.com/Likolus
-// @version      1.4.3
+// @version      1.4.4
 // @description  Export Sketchfab models to OBJ (static) or FBX (binary 7.4.0 — Maya/Blender/3ds-Max native, rig+anim+skin) or glTF. Maya/Blender-ready: materials, textures, skeleton, skin weights, animations — nothing lost. Improved fork of SUR.
 // @author       Likolus
 // @match        https://sketchfab.com/*
@@ -1418,6 +1418,15 @@
         // node + property helpers
         function N(name,props,children){ return {name:name,props:props||[],children:children||null}; }
         function S(v){ var s=String(v); return {type:'S',val:s,count:s.length}; }
+        // FBX object name property: must be encoded as "name\x00\x01ClassName"
+        // (NOT "ClassName::name"). Autodesk FBX SDK, Maya, Blender, 3ds Max all
+        // parse the name by splitting on the \x00\x01 separator. Without it,
+        // Blender raises ValueError and Maya silently drops the object.
+        // The 3rd property (className) is also required by strict readers.
+        function objName(name, className){
+            var s = String(name) + '\x00\x01' + String(className);
+            return { type:'S', val:s, count:s.length };
+        }
         function I(v){ return {type:'I',val:v|0}; }
         function L(v){ return {type:'L',val:v}; }
         function D(v){ return {type:'D',val:+v}; }
@@ -1659,12 +1668,12 @@
             layCh.push(N('LayerElement', [], [N('Type', [S('LayerElementMaterial')]), N('TypedIndex', [I(0)])]));
             gKids.push(N('Layer', [I(0)], layCh));
 
-            objChildren.push(N('Geometry', [L(meshGeoIds[i]), S('Geometry::' + geoName), S('Mesh')], gKids));
+            objChildren.push(N('Geometry', [L(meshGeoIds[i]), objName(geoName, 'Geometry'), S('Mesh')], gKids));
 
             // Skin deformer + per-bone clusters
             if (skinIds[i]) {
                 var skinObj = rigSkinByGeoIdx[i];
-                objChildren.push(N('Deformer', [L(skinIds[i]), S('Deformer::Skin_' + geoName), S('Skin')], [
+                objChildren.push(N('Deformer', [L(skinIds[i]), objName('Skin_' + geoName, 'Deformer'), S('Skin')], [
                     N('Version', [I(101)]), N('Link_DeformAcuracy', [D(4.5)])
                 ]));
                 var vcount = g.vertex.length / 3;
@@ -1689,7 +1698,7 @@
                         var inv = invertMat4(bone.ibm);
                         if (inv) transformLink = Array.prototype.slice.call(inv);
                     }
-                    objChildren.push(N('Deformer', [L(cid), S('Deformer::Cluster_' + bone.name), S('Cluster')], [
+                    objChildren.push(N('Deformer', [L(cid), objName('Cluster_' + bone.name, 'Deformer'), S('Cluster')], [
                         N('Version', [I(100)]),
                         N('Indexes', [iArr(idxs, idxs.length)]),
                         N('Weights', [dArr(wts, wts.length)]),
@@ -1700,7 +1709,7 @@
             }
 
             // Mesh Model node
-            objChildren.push(N('Model', [L(meshModelIds[i]), S('Model::' + geoName), S('Mesh')], [
+            objChildren.push(N('Model', [L(meshModelIds[i]), objName(geoName, 'Model'), S('Mesh')], [
                 N('Version', [I(232)]),
                 N('Properties70', [], [
                     Pbool('RotationActive', 1), Penum('InheritType', 1),
@@ -1714,7 +1723,7 @@
         // Bone Model nodes (LimbNode) with local TRS
         rigBones.forEach(function (bone, bi) {
             var e = quatToEulerXYZDeg(bone.rotation[0], bone.rotation[1], bone.rotation[2], bone.rotation[3]);
-            objChildren.push(N('Model', [L(boneModelIds[bi]), S('Model::' + bone.name), S('LimbNode')], [
+            objChildren.push(N('Model', [L(boneModelIds[bi]), objName(bone.name, 'Model'), S('LimbNode')], [
                 N('Version', [I(232)]),
                 N('Properties70', [], [
                     Pbool('RotationActive', 1), Pint('RotationOrder', 0),
@@ -1727,7 +1736,7 @@
 
         // Materials
         materials.forEach(function (m, mi) {
-            objChildren.push(N('Material', [L(matIds[mi]), S('Material::' + m.name), S('')], [
+            objChildren.push(N('Material', [L(matIds[mi]), objName(m.name, 'Material'), S('')], [
                 N('Version', [I(102)]),
                 N('ShadingModel', [S('phong')]),
                 N('MultiLayer', [I(0)]),
@@ -1743,7 +1752,7 @@
         // Videos (image clips)
         Object.keys(videoIds).forEach(function (cu) {
             var t = textureStore[cu]; if (!t) return;
-            objChildren.push(N('Video', [L(videoIds[cu]), S('Video::' + t.name), S('Clip')], [
+            objChildren.push(N('Video', [L(videoIds[cu]), objName(t.name, 'Video'), S('Clip')], [
                 N('Type', [S('Clip')]),
                 N('Properties70', [], [ Pstr('Path', 'textures/' + t.name) ]),
                 N('UseMipMap', [I(0)]),
@@ -1757,12 +1766,12 @@
             ['albedo','normal','roughness','metallic','emissive','occlusion','specular','opacity'].forEach(function (ty) {
                 var t = m.slots[ty]; if (!t) return;
                 var tid = texIdsByKey[m.name + '_' + ty]; if (!tid) return;
-                objChildren.push(N('Texture', [L(tid), S('Texture::' + t.name), S('')], [
+                objChildren.push(N('Texture', [L(tid), objName(t.name, 'Texture'), S('')], [
                     N('Type', [S('TextureVideoClip')]),
                     N('Version', [I(202)]),
-                    N('TextureName', [S('Texture::' + t.name)]),
+                    N('TextureName', [objName(t.name, 'Texture')]),
                     N('Properties70', [], [ Penum('CurrentTextureBlendMode', 0) ]),
-                    N('Media', [S('Video::' + t.name)]),
+                    N('Media', [objName(t.name, 'Video')]),
                     N('FileName', [S('textures/' + t.name)]),
                     N('RelativeFilename', [S('textures/' + t.name)])
                 ]));
@@ -1773,10 +1782,10 @@
         var curveNodes = [], curves = [];
         rigAnimations.forEach(function (anim, ai) {
             var stopTicks = Math.round((anim.duration || 0) * 46186158000);
-            objChildren.push(N('AnimationStack', [L(stackIds[ai]), S('AnimStack::' + anim.name)], [
+            objChildren.push(N('AnimationStack', [L(stackIds[ai]), objName(anim.name, 'AnimStack'), S('')], [
                 N('Properties70', [], [ Ptime('LocalStop', stopTicks) ])
             ]));
-            objChildren.push(N('AnimationLayer', [L(layerIds[ai]), S('AnimLayer::' + anim.name)], [
+            objChildren.push(N('AnimationLayer', [L(layerIds[ai]), objName(anim.name, 'AnimLayer'), S('')], [
                 N('Weight', [D(100)]), N('Mute', [I(0)]), N('Solo', [I(0)]), N('Lock', [I(0)])
             ]));
             anim.channels.forEach(function (ch) {
@@ -1785,7 +1794,7 @@
                 var srcStride = isRot ? 4 : 3;
                 var propName = ch.path === 'translation' ? 'Lcl Translation' : (ch.path === 'rotation' ? 'Lcl Rotation' : 'Lcl Scaling');
                 var cnId = nid();
-                objChildren.push(N('AnimationCurveNode', [L(cnId), S('AnimCurveNode::' + propName)], [
+                objChildren.push(N('AnimationCurveNode', [L(cnId), objName(propName, 'AnimCurveNode'), S('')], [
                     N('Properties70', [], [ Pdbl('d|X', 0), Pdbl('d|Y', 0), Pdbl('d|Z', 0) ])
                 ]));
                 curveNodes.push({ id: cnId, layerId: layerIds[ai], modelId: tgt, propName: propName });
