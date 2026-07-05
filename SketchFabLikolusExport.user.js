@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         SketchFab Likolus Export
 // @namespace    https://github.com/Likolus
-// @version      1.4.2
+// @version      1.4.3
 // @description  Export Sketchfab models to OBJ (static) or FBX (binary 7.4.0 — Maya/Blender/3ds-Max native, rig+anim+skin) or glTF. Maya/Blender-ready: materials, textures, skeleton, skin weights, animations — nothing lost. Improved fork of SUR.
 // @author       Likolus
 // @match        https://sketchfab.com/*
@@ -732,11 +732,47 @@
             w.push('usemtl ' + g.materialName + '\n');
             w.push('s 1\n');
 
-            function fmtFace(num) {
-                var s = '' + num;
-                if (hasUV && hasN) return s + '/' + s + '/' + s;
-                if (hasUV) return s + '/' + s;
-                if (hasN) return s + '//' + s;
+            // Per-geometry attribute counts (for index validation).
+            // If idx[j] >= uvCount we can't reference a UV for that vertex,
+            // so we drop UV for that face (write v//vn instead of v/vt/vn).
+            var vCount = v.length / 3;
+            var uvCount = hasUV ? (uv.length / 2) : 0;
+            var nCount = hasN ? (n.length / 3) : 0;
+
+            // Build a face string with SEPARATE indices for v / vt / vn.
+            // Each attribute gets its own global offset (vOff / vtOff / vnOff),
+            // which is critical when one geometry has UV and another doesn't —
+            // otherwise the UV index would inherit the vertex offset and point
+            // past the end of the vt list.
+            function fmtFace(vidx) {
+                // vidx is the 0-based index from the primitive's index buffer.
+                // Validate against each attribute's count and emit 1-based index.
+                var v1 = vidx + 1 + vOff;
+                var parts = [String(v1)];
+                if (hasUV) {
+                    if (uvCount > 0 && vidx < uvCount) {
+                        parts.push(String(vidx + 1 + vtOff));
+                    } else {
+                        // vertex index out of UV range — emit empty vt slot
+                        parts.push('');
+                    }
+                } else if (hasN) {
+                    // no UV but has normal -> "v//vn" format
+                    parts.push('');
+                }
+                if (hasN) {
+                    if (nCount > 0 && vidx < nCount) {
+                        parts.push(String(vidx + 1 + vnOff));
+                    } else {
+                        parts.push('');
+                    }
+                }
+                // Join with '/'. If UV slot is empty and normal exists, we get "v//vn".
+                // If only v, we get "v".
+                var s = parts.join('/');
+                // Cleanup: if hasUV=false and hasN=true, parts=['v','','vn'] -> "v//vn" ✓
+                // If hasUV=true and hasN=false, parts=['v','vt'] -> "v/vt" ✓
+                // If both, parts=['v','vt','vn'] -> "v/vt/vn" ✓ (or "v//vn" if vt empty)
                 return s;
             }
 
@@ -746,28 +782,31 @@
                 var mode = prim.mode, idx = prim.indices;
                 if (mode === 4 || mode === undefined) {
                     for (var j = 0; j + 2 < idx.length; j += 3) {
-                        var a = idx[j] + 1 + vOff, b = idx[j + 1] + 1 + vOff, c = idx[j + 2] + 1 + vOff;
-                        w.push('f ' + fmtFace(a) + ' ' + fmtFace(b) + ' ' + fmtFace(c) + '\n');
+                        // Bounds-check vertex indices (skip degenerate / OOB triangles)
+                        if (idx[j] >= vCount || idx[j+1] >= vCount || idx[j+2] >= vCount) continue;
+                        w.push('f ' + fmtFace(idx[j]) + ' ' + fmtFace(idx[j+1]) + ' ' + fmtFace(idx[j+2]) + '\n');
                     }
                 } else if (mode === 5) { // triangle strip
                     for (var j = 0; j + 2 < idx.length; j++) {
-                        var a = idx[j] + 1 + vOff, b = idx[j + 1] + 1 + vOff, c = idx[j + 2] + 1 + vOff;
+                        if (idx[j] >= vCount || idx[j+1] >= vCount || idx[j+2] >= vCount) continue;
+                        var a = idx[j], b = idx[j+1], c = idx[j+2];
                         if (j & 1) { var tmp = b; b = c; c = tmp; }
                         w.push('f ' + fmtFace(a) + ' ' + fmtFace(b) + ' ' + fmtFace(c) + '\n');
                     }
                 } else if (mode === 6) { // triangle fan
-                    var center = idx[0] + 1 + vOff;
+                    if (idx[0] >= vCount) continue;
                     for (var j = 1; j + 1 < idx.length; j++) {
-                        w.push('f ' + fmtFace(center) + ' ' + fmtFace(idx[j] + 1 + vOff) + ' ' + fmtFace(idx[j + 1] + 1 + vOff) + '\n');
+                        if (idx[j] >= vCount || idx[j+1] >= vCount) continue;
+                        w.push('f ' + fmtFace(idx[0]) + ' ' + fmtFace(idx[j]) + ' ' + fmtFace(idx[j+1]) + '\n');
                     }
                 } else {
                     dlog('unknown primitive mode', mode);
                 }
             }
 
-            vOff += v.length / 3;
-            if (hasUV) vtOff += uv.length / 2;
-            if (hasN) vnOff += n.length / 3;
+            vOff += vCount;
+            if (hasUV) vtOff += uvCount;
+            if (hasN) vnOff += nCount;
             w.push('\n');
         });
 
