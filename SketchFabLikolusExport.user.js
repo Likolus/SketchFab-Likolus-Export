@@ -19,7 +19,6 @@
 // @supportURL   https://github.com/Likolus/SketchFab-Likolus-Export/issues
 // @updateURL    https://raw.githubusercontent.com/Likolus/SketchFab-Likolus-Export/main/SketchFabLikolusExport.user.js
 // @downloadURL  https://raw.githubusercontent.com/Likolus/SketchFab-Likolus-Export/main/SketchFabLikolusExport.user.js
-// @icon         https://raw.githubusercontent.com/Likolus/SketchFab-Likolus-Export/main/icon.png
 // ==/UserScript==
 
 /* =====================================================================
