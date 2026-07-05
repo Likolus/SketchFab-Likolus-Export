@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         SketchFab Likolus Export
 // @namespace    https://github.com/Likolus
-// @version      1.3.3
-// @description  Export Sketchfab models to OBJ (static) or FBX (Maya-native rig+anim+skin) or glTF. Maya/Blender-ready: materials, textures, skeleton, skin weights, animations — nothing lost. Improved fork of SUR.
+// @version      1.4.0
+// @description  Export Sketchfab models to OBJ (static) or FBX (binary 7.4.0 — Maya/Blender/3ds-Max native, rig+anim+skin) or glTF. Maya/Blender-ready: materials, textures, skeleton, skin weights, animations — nothing lost. Improved fork of SUR.
 // @author       Likolus
 // @match        https://sketchfab.com/*
 // @include      /^https?://(www\.)?sketchfab\.com/.*$/
@@ -1258,33 +1258,111 @@
     }
 
     function buildFBX(modelName) {
+        // =================================================================
+        //  Binary FBX 7.4.0 generator
+        //  -----------------------------------------------------------------
+        //  Maya / Blender / 3ds Max / every online FBX viewer reliably
+        //  import BINARY FBX. Blender does NOT import ASCII FBX at all,
+        //  which was the root cause of "model has data but is invisible in
+        //  every editor". This generator emits a spec-compliant binary
+        //  FBX 7400 stream carrying geometry, normals, UVs, materials,
+        //  textures, skeleton, skin weights and animations.
+        //
+        //  Format verified on 3dviewer.net (cube: 36 verts / 12 tris / 2x2x2).
+        // =================================================================
+
         var nextId = 1000;
         function nid() { return nextId++; }
-        var out = [];
-        function L(s) { out.push(s); }
 
-        var materials = buildMaterials();
-        var ident = [1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1];
+        // ---- chunked byte buffer (efficient for large typed arrays) ----
+        function BBuf(){ this.chunks=[]; this.len=0; }
+        BBuf.prototype.u8=function(v){ this.chunks.push(new Uint8Array([v&0xff])); this.len++; };
+        BBuf.prototype.u16=function(v){ var b=new Uint8Array(2); new DataView(b.buffer).setUint16(0,v&0xffff,true); this.chunks.push(b); this.len+=2; };
+        BBuf.prototype.u32=function(v){ var b=new Uint8Array(4); new DataView(b.buffer).setUint32(0,v>>>0,true); this.chunks.push(b); this.len+=4; };
+        BBuf.prototype.i64=function(v){ var lo=v>>>0,hi=Math.floor(v/0x100000000)>>>0,b=new Uint8Array(8),dv=new DataView(b.buffer); dv.setUint32(0,lo,true); dv.setUint32(4,hi,true); this.chunks.push(b); this.len+=8; };
+        BBuf.prototype.dbl=function(v){ var b=new Uint8Array(8); new DataView(b.buffer).setFloat64(0,+v,true); this.chunks.push(b); this.len+=8; };
+        BBuf.prototype.flt=function(v){ var b=new Uint8Array(4); new DataView(b.buffer).setFloat32(0,+v,true); this.chunks.push(b); this.len+=4; };
+        BBuf.prototype.dblArr=function(arr,count){ var a=new Float64Array(count); for(var i=0;i<count;i++)a[i]=arr[i]; var b=new Uint8Array(a.buffer); this.chunks.push(b); this.len+=b.length; };
+        BBuf.prototype.i32Arr=function(arr,count){ var a=new Int32Array(count); for(var i=0;i<count;i++)a[i]=arr[i]|0; var b=new Uint8Array(a.buffer); this.chunks.push(b); this.len+=b.length; };
+        BBuf.prototype.strBytes=function(s){ var n=s.length,b=new Uint8Array(n); for(var i=0;i<n;i++)b[i]=s.charCodeAt(i)&0xff; this.chunks.push(b); this.len+=n; };
+        BBuf.prototype.toU8=function(){ var out=new Uint8Array(this.len),off=0; for(var i=0;i<this.chunks.length;i++){ out.set(this.chunks[i],off); off+=this.chunks[i].length; } return out; };
 
-        // expand primitive indices into a flat polygon-vertex vertex-index list (3 per triangle)
-        function expandPV(g) {
-            var r = [];
-            g.primitives.forEach(function (p) {
-                var idx = p.indices, mode = p.mode;
-                if (mode === 4 || mode === undefined) {
-                    for (var j = 0; j+2 < idx.length; j += 3) r.push(idx[j], idx[j+1], idx[j+2]);
-                } else if (mode === 5) {
-                    for (var j = 0; j+2 < idx.length; j++) {
-                        var a=idx[j],b=idx[j+1],c=idx[j+2];
-                        if (j & 1) { var t=b; b=c; c=t; }
-                        r.push(a,b,c);
-                    }
-                } else if (mode === 6) {
-                    for (var j = 1; j+1 < idx.length; j++) r.push(idx[0], idx[j], idx[j+1]);
-                }
+        // ---- node tree ----
+        // node = { name, props:[{type,val/arr/count}], children:[nodes] or null }
+        function propSize(p){
+            var t=p.type,s=1; // type char
+            if(t==='S') s+=4+p.count;
+            else if(t==='Y') s+=2;
+            else if(t==='C') s+=1;
+            else if(t==='I') s+=4;
+            else if(t==='F') s+=4;
+            else if(t==='D') s+=8;
+            else if(t==='L') s+=8;
+            else if(t==='d') s+=12+p.count*8;
+            else if(t==='i') s+=12+p.count*4;
+            return s;
+        }
+        function nodeSize(n){
+            var ps=0; for(var i=0;i<n.props.length;i++) ps+=propSize(n.props[i]);
+            var h=13+n.name.length, cb=0;
+            if(n.children&&n.children.length){ for(var j=0;j<n.children.length;j++) cb+=nodeSize(n.children[j]); cb+=13; }
+            return h+ps+cb;
+        }
+        function writeProp(buf,p){
+            var t=p.type; buf.u8(t.charCodeAt(0));
+            if(t==='S'){ buf.u32(p.count); buf.strBytes(p.val); }
+            else if(t==='Y'){ buf.u16(p.val); }
+            else if(t==='C'){ buf.u8(p.val?1:0); }
+            else if(t==='I'){ buf.u32(p.val); }
+            else if(t==='F'){ buf.flt(p.val); }
+            else if(t==='D'){ buf.dbl(p.val); }
+            else if(t==='L'){ buf.i64(p.val); }
+            else if(t==='d'){ buf.u32(p.count); buf.u32(0); buf.u32(p.count*8); buf.dblArr(p.arr,p.count); }
+            else if(t==='i'){ buf.u32(p.count); buf.u32(0); buf.u32(p.count*4); buf.i32Arr(p.arr,p.count); }
+        }
+        function serializeNode(buf,n,start){
+            var ps=0; for(var i=0;i<n.props.length;i++) ps+=propSize(n.props[i]);
+            var nl=n.name.length, hasCh=n.children&&n.children.length, cb=0;
+            if(hasCh){ for(var j=0;j<n.children.length;j++) cb+=nodeSize(n.children[j]); cb+=13; }
+            var end=start+13+nl+ps+cb;
+            buf.u32(end); buf.u32(n.props.length); buf.u32(ps); buf.u8(nl); buf.strBytes(n.name);
+            for(var k=0;k<n.props.length;k++) writeProp(buf,n.props[k]);
+            var off=start+13+nl+ps;
+            if(hasCh){ for(var c=0;c<n.children.length;c++){ serializeNode(buf,n.children[c],off); off+=nodeSize(n.children[c]); } buf.u32(0); buf.u32(0); buf.u32(0); buf.u8(0); }
+            return end;
+        }
+        // node + property helpers
+        function N(name,props,children){ return {name:name,props:props||[],children:children||null}; }
+        function S(v){ var s=String(v); return {type:'S',val:s,count:s.length}; }
+        function I(v){ return {type:'I',val:v|0}; }
+        function L(v){ return {type:'L',val:v}; }
+        function D(v){ return {type:'D',val:+v}; }
+        function dArr(arr,count){ return {type:'d',arr:arr,count:count}; }
+        function iArr(arr,count){ return {type:'i',arr:arr,count:count}; }
+        // Properties70 "P" node builders
+        function Pint(n,v){ return N('P',[S(n),S('int'),S('Integer'),S(''),I(v)]); }
+        function Pbool(n,v){ return N('P',[S(n),S('bool'),S(''),S(''),I(v?1:0)]); }
+        function Penum(n,v){ return N('P',[S(n),S('enum'),S(''),S(''),I(v)]); }
+        function Pdbl(n,v){ return N('P',[S(n),S('double'),S('Number'),S(''),D(v)]); }
+        function Pstr(n,v){ return N('P',[S(n),S('KString'),S(''),S(''),S(v)]); }
+        function Pvec(n,x,y,z){ return N('P',[S(n),S(n),S(''),S('A'),D(x),D(y),D(z)]); }
+        function Ptime(n,v){ return N('P',[S(n),S('KTime'),S('Time'),S(''),L(v)]); }
+        function Pcolor(n,r,g,b){ return N('P',[S(n),S('Color'),S(''),S('A'),D(r),D(g),D(b)]); }
+
+        // ---- expand primitive indices into a flat polygon-vertex list ----
+        function expandPV(g){
+            var r=[];
+            g.primitives.forEach(function(p){
+                var idx=p.indices, mode=p.mode;
+                if(mode===4||mode===undefined){ for(var j=0;j+2<idx.length;j+=3) r.push(idx[j],idx[j+1],idx[j+2]); }
+                else if(mode===5){ for(var j=0;j+2<idx.length;j++){ var a=idx[j],b=idx[j+1],c=idx[j+2]; if(j&1){var t=b;b=c;c=t;} r.push(a,b,c); } }
+                else if(mode===6){ for(var j=1;j+1<idx.length;j++) r.push(idx[0],idx[j],idx[j+1]); }
             });
             return r;
         }
+
+        var materials = buildMaterials();
+        var ident = [1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1];
 
         // ---- allocate unique IDs ----
         var meshGeoIds = [], meshModelIds = [];
@@ -1309,153 +1387,128 @@
         rigAnimations.forEach(function () { stackIds.push(nid()); layerIds.push(nid()); });
 
         var nModel = geometries.length + rigBones.length;
-        var nGeo = geometries.length;
-        var nMat = materials.length;
-        var nVid = Object.keys(videoIds).length;
-        var nTex = Object.keys(texIdsByKey).length;
+        var nGeo = geometries.length, nMat = materials.length;
+        var nVid = Object.keys(videoIds).length, nTex = Object.keys(texIdsByKey).length;
         var nDef = Object.keys(skinIds).length + Object.keys(clusterIds).length;
         var nStack = rigAnimations.length;
-
-        // Definitions Count = total number of object instances across all types.
-        // GlobalSettings(1) + Model(nModel) + Geometry(nGeo) + Material(nMat) +
-        // Video(nVid) + Texture(nTex) + Deformer(nDef) +
-        // AnimationStack(nStack) + AnimationLayer(nStack) +
-        // AnimationCurveNode + AnimationCurve (allocated dynamically, not counted here).
         var defCount = 1 + nModel + nGeo + nMat + nVid + nTex + nDef + nStack * 2;
 
-        // ---- header ----
-        L('; FBX 7.4.0 project file');
-        L('; Generated by SketchFab Likolus Export');
-        L('FBXHeaderExtension:  {');
-        L('\tFBXHeaderVersion: 1003');
-        L('\tFBXVersion: 7400');
-        L('\tCreationTimeStamp:  {');
-        L('\t\tVersion: 1000');
+        // ---- build top-level node tree ----
+        var topLevel = [];
         var d = new Date();
-        L('\t\tYear: ' + d.getFullYear());
-        L('\t\tMonth: ' + (d.getMonth()+1));
-        L('\t\tDay: ' + d.getDate());
-        L('\t\tHour: ' + d.getHours());
-        L('\t\tMinute: ' + d.getMinutes());
-        L('\t\tSecond: ' + d.getSeconds());
-        L('\t\tMillisecond: ' + d.getMilliseconds());
-        L('\t}');
-        L('\tCreator: "SketchFab Likolus Export"');
-        L('}');
-        L('GlobalSettings:  {');
-        L('\tVersion: 1000');
-        L('\tProperties70:  {');
-        L('\t\tP: "UpAxis", "int", "Integer", "",1');
-        L('\t\tP: "UpAxisSign", "int", "Integer", "",1');
-        L('\t\tP: "FrontAxis", "int", "Integer", "",2');
-        L('\t\tP: "FrontAxisSign", "int", "Integer", "",1');
-        L('\t\tP: "CoordAxis", "int", "Integer", "",0');
-        L('\t\tP: "CoordAxisSign", "int", "Integer", "",1');
-        L('\t\tP: "OriginalUpAxis", "int", "Integer", "",1');
-        L('\t\tP: "OriginalUnitScaleFactor", "double", "Number", "",1');
-        L('\t\tP: "UnitScaleFactor", "double", "Number", "",1');
-        L('\t}');
-        L('}');
 
-        var defCount = 1 + nModel + nGeo + nMat + nVid + nTex + nDef + nStack * 2;
-        L('Definitions:  {');
-        L('\tVersion: 100');
-        L('\tCount: ' + defCount);
-        L('\tObjectType: "GlobalSettings" {'); L('\t\tCount: 1'); L('\t}');
-        L('\tObjectType: "Model" {'); L('\t\tCount: ' + nModel); L('\t}');
-        L('\tObjectType: "Geometry" {'); L('\t\tCount: ' + nGeo); L('\t}');
-        if (nMat) { L('\tObjectType: "Material" {'); L('\t\tCount: ' + nMat); L('\t}'); }
-        if (nVid) { L('\tObjectType: "Video" {'); L('\t\tCount: ' + nVid); L('\t}'); }
-        if (nTex) { L('\tObjectType: "Texture" {'); L('\t\tCount: ' + nTex); L('\t}'); }
-        if (nDef) { L('\tObjectType: "Deformer" {'); L('\t\tCount: ' + nDef); L('\t}'); }
+        // FBXHeaderExtension
+        topLevel.push(N('FBXHeaderExtension', [], [
+            N('FBXHeaderVersion', [I(1003)]),
+            N('FBXVersion', [I(7400)]),
+            N('CreationTimeStamp', [], [
+                N('Version', [I(1000)]),
+                N('Year', [I(d.getFullYear())]), N('Month', [I(d.getMonth()+1)]), N('Day', [I(d.getDate())]),
+                N('Hour', [I(d.getHours())]), N('Minute', [I(d.getMinutes())]), N('Second', [I(d.getSeconds())]),
+                N('Millisecond', [I(d.getMilliseconds())])
+            ]),
+            N('Creator', [S('SketchFab Likolus Export')])
+        ]));
+
+        // GlobalSettings
+        topLevel.push(N('GlobalSettings', [], [
+            N('Version', [I(1000)]),
+            N('Properties70', [], [
+                Pint('UpAxis',1), Pint('UpAxisSign',1), Pint('FrontAxis',2), Pint('FrontAxisSign',1),
+                Pint('CoordAxis',0), Pint('CoordAxisSign',1), Pint('OriginalUpAxis',1),
+                Pdbl('OriginalUnitScaleFactor',1), Pdbl('UnitScaleFactor',1)
+            ])
+        ]));
+
+        // Definitions
+        var defChildren = [
+            N('Version', [I(100)]),
+            N('Count', [I(defCount)]),
+            N('ObjectType', [S('GlobalSettings')], [N('Count', [I(1)])])
+        ];
+        if (nModel) defChildren.push(N('ObjectType', [S('Model')], [N('Count', [I(nModel)])]));
+        if (nGeo) defChildren.push(N('ObjectType', [S('Geometry')], [N('Count', [I(nGeo)])]));
+        if (nMat) defChildren.push(N('ObjectType', [S('Material')], [N('Count', [I(nMat)])]));
+        if (nVid) defChildren.push(N('ObjectType', [S('Video')], [N('Count', [I(nVid)])]));
+        if (nTex) defChildren.push(N('ObjectType', [S('Texture')], [N('Count', [I(nTex)])]));
+        if (nDef) defChildren.push(N('ObjectType', [S('Deformer')], [N('Count', [I(nDef)])]));
         if (nStack) {
-            L('\tObjectType: "AnimationStack" {'); L('\t\tCount: ' + nStack); L('\t}');
-            L('\tObjectType: "AnimationLayer" {'); L('\t\tCount: ' + nStack); L('\t}');
+            defChildren.push(N('ObjectType', [S('AnimationStack')], [N('Count', [I(nStack)])]));
+            defChildren.push(N('ObjectType', [S('AnimationLayer')], [N('Count', [I(nStack)])]));
         }
-        L('}');
+        topLevel.push(N('Definitions', [], defChildren));
 
-        // ---- Objects ----
-        L('Objects:  {');
+        // Objects
+        var objChildren = [];
 
-        // Geometry + skin + clusters + mesh Model per geometry
         geometries.forEach(function (g, i) {
             var pv = expandPV(g);
-            L('\tGeometry: ' + meshGeoIds[i] + ', "Geometry::' + g.name + '", "Mesh" {');
+            var sc = settings.scale;
+            // vertices (doubles, scaled)
+            var varr = new Array(g.vertex.length);
+            for (var vi = 0; vi < g.vertex.length; vi++) varr[vi] = g.vertex[vi] * sc;
+            // polygon-vertex index (negate last index of each triangle)
+            var pvic = pv.length;
+            var pvarr = new Array(pvic);
+            for (var p = 0; p < pvic; p += 3) { pvarr[p] = pv[p]; pvarr[p+1] = pv[p+1]; pvarr[p+2] = -(pv[p+2]+1); }
+
+            var gKids = [ N('GeometryVersion', [I(124)]) ];
             // Vertices
-            L('\t\tVertices: *' + g.vertex.length + ' {');
-            var vv = [];
-            for (var vi = 0; vi < g.vertex.length; vi += 3) {
-                vv.push(fnum(g.vertex[vi]*settings.scale) + ',' + fnum(g.vertex[vi+1]*settings.scale) + ',' + fnum(g.vertex[vi+2]*settings.scale));
-            }
-            L('\t\ta: ' + fmtLong(vv));
-            L('\t}');
-            // PolygonVertexIndex (negate last index of each triangle)
-            L('\t\tPolygonVertexIndex: *' + pv.length + ' {');
-            var pvi = [];
-            for (var p = 0; p < pv.length; p += 3) pvi.push(pv[p] + ',' + pv[p+1] + ',' + (-(pv[p+2]+1)));
-            L('\t\ta: ' + fmtLong(pvi));
-            L('\t}');
+            gKids.push(N('Vertices', [dArr(varr, g.vertex.length)]));
+            // PolygonVertexIndex
+            gKids.push(N('PolygonVertexIndex', [iArr(pvarr, pvic)]));
             // Normals (ByPolygonVertex Direct — one per polygon-vertex)
             if (g.normal && g.normal.length) {
-                L('\t\tLayerElementNormal: 0 {');
-                L('\t\t\tVersion: 101');
-                L('\t\t\tName: ""');
-                L('\t\t\tMappingInformationType: "ByPolygonVertex"');
-                L('\t\t\tReferenceInformationType: "Direct"');
-                var nn = [];
-                for (var p = 0; p < pv.length; p++) {
-                    var ni = pv[p]*3;
-                    nn.push(fnum(g.normal[ni]||0) + ',' + fnum(g.normal[ni+1]||0) + ',' + fnum(g.normal[ni+2]||0));
+                var nc = pv.length * 3, narr = new Array(nc);
+                for (var pp = 0; pp < pv.length; pp++) {
+                    var ni = pv[pp]*3;
+                    narr[pp*3] = g.normal[ni]||0; narr[pp*3+1] = g.normal[ni+1]||0; narr[pp*3+2] = g.normal[ni+2]||0;
                 }
-                L('\t\t\tNormals: *' + (pv.length*3) + ' {');
-                L('\t\t\ta: ' + fmtLong(nn));
-                L('\t\t}');
-                L('\t\t}');
+                gKids.push(N('LayerElementNormal', [I(0)], [
+                    N('Version', [I(101)]), N('Name', [S('')]),
+                    N('MappingInformationType', [S('ByPolygonVertex')]),
+                    N('ReferenceInformationType', [S('Direct')]),
+                    N('Normals', [dArr(narr, nc)])
+                ]));
             }
-            // UVs (ByPolygonVertex IndexToDirect — UVs are vertex-indexed in our data)
+            // UVs (ByPolygonVertex IndexToDirect)
             if (g.uv && g.uv.length) {
-                L('\t\tLayerElementUV: 0 {');
-                L('\t\t\tVersion: 101');
-                L('\t\t\tName: "map1"');
-                L('\t\t\tMappingInformationType: "ByPolygonVertex"');
-                L('\t\t\tReferenceInformationType: "IndexToDirect"');
-                var uu = [];
-                for (var ui = 0; ui < g.uv.length; ui += 2) {
+                var uc = g.uv.length, uarr = new Array(uc);
+                for (var ui = 0; ui < uc; ui += 2) {
                     var uU = g.uv[ui], vV = g.uv[ui+1];
                     if (settings.flipUV) vV = 1 - vV;
-                    uu.push(fnum(uU) + ',' + fnum(vV));
+                    uarr[ui] = uU; uarr[ui+1] = vV;
                 }
-                L('\t\t\tUV: *' + g.uv.length + ' {');
-                L('\t\t\ta: ' + fmtLong(uu));
-                L('\t\t}');
-                L('\t\t\tUVIndex: *' + pv.length + ' {');
-                L('\t\t\ta: ' + fmtLong(pv));
-                L('\t\t}');
-                L('\t\t}');
+                gKids.push(N('LayerElementUV', [I(0)], [
+                    N('Version', [I(101)]), N('Name', [S('map1')]),
+                    N('MappingInformationType', [S('ByPolygonVertex')]),
+                    N('ReferenceInformationType', [S('IndexToDirect')]),
+                    N('UV', [dArr(uarr, uc)]),
+                    N('UVIndex', [iArr(pv, pv.length)])
+                ]));
             }
             // Material (AllSame — one material per geometry)
-            L('\t\tLayerElementMaterial: 0 {');
-            L('\t\t\tVersion: 101');
-            L('\t\t\tName: ""');
-            L('\t\t\tMappingInformationType: "AllSame"');
-            L('\t\t\tReferenceInformationType: "IndexToDirect"');
-            L('\t\t\tMaterials: *1 {'); L('\t\t\ta: 0'); L('\t\t}');
-            L('\t\t}');
-            L('\t\tLayer: 0 {');
-            L('\t\t\tVersion: 100');
-            if (g.normal && g.normal.length) { L('\t\t\tLayerElement:  {'); L('\t\t\t\tType: "LayerElementNormal"'); L('\t\t\t\tTypedIndex: 0'); L('\t\t\t}'); }
-            if (g.uv && g.uv.length) { L('\t\t\tLayerElement:  {'); L('\t\t\t\tType: "LayerElementUV"'); L('\t\t\t\tTypedIndex: 0'); L('\t\t\t}'); }
-            L('\t\t\tLayerElement:  {'); L('\t\t\t\tType: "LayerElementMaterial"'); L('\t\t\t\tTypedIndex: 0'); L('\t\t\t}');
-            L('\t\t}');
-            L('\t}'); // end Geometry
+            gKids.push(N('LayerElementMaterial', [I(0)], [
+                N('Version', [I(101)]), N('Name', [S('')]),
+                N('MappingInformationType', [S('AllSame')]),
+                N('ReferenceInformationType', [S('IndexToDirect')]),
+                N('Materials', [iArr([0], 1)])
+            ]));
+            // Layer
+            var layCh = [];
+            if (g.normal && g.normal.length) layCh.push(N('LayerElement', [], [N('Type', [S('LayerElementNormal')]), N('TypedIndex', [I(0)])]));
+            if (g.uv && g.uv.length) layCh.push(N('LayerElement', [], [N('Type', [S('LayerElementUV')]), N('TypedIndex', [I(0)])]));
+            layCh.push(N('LayerElement', [], [N('Type', [S('LayerElementMaterial')]), N('TypedIndex', [I(0)])]));
+            gKids.push(N('Layer', [I(0)], layCh));
+
+            objChildren.push(N('Geometry', [L(meshGeoIds[i]), S('Geometry::' + g.name), S('Mesh')], gKids));
 
             // Skin deformer + per-bone clusters
             if (skinIds[i]) {
                 var skinObj = rigSkinByGeoIdx[i];
-                L('\tDeformer: ' + skinIds[i] + ', "Deformer::Skin_' + g.name + '", "Skin" {');
-                L('\t\tVersion: 101');
-                L('\t\tLink_DeformAcuracy: 4.5');
-                L('\t}');
+                objChildren.push(N('Deformer', [L(skinIds[i]), S('Deformer::Skin_' + g.name), S('Skin')], [
+                    N('Version', [I(101)]), N('Link_DeformAcuracy', [D(4.5)])
+                ]));
                 var vcount = g.vertex.length / 3;
                 var ja = skinObj.jointAttr, wa = skinObj.weightAttr;
                 var perVert = (ja.length / vcount) | 0; if (perVert < 1) perVert = 4;
@@ -1464,92 +1517,81 @@
                     var cid = clusterIds[i + '_' + jb];
                     var idxs = [], wts = [];
                     for (var vv2 = 0; vv2 < vcount; vv2++) {
-                        for (var c = 0; c < perVert; c++) {
-                            var srcIdx = vv2 * perVert + c;
+                        for (var c2 = 0; c2 < perVert; c2++) {
+                            var srcIdx = vv2 * perVert + c2;
                             var jv = (srcIdx < ja.length ? (ja[srcIdx] | 0) : 0);
                             var mapped = (jv < skinObj.joints.length) ? skinObj.joints[jv] : 0;
                             var wv = (srcIdx < wa.length ? wa[srcIdx] : 0);
                             if (mapped === jb && wv > 0) { idxs.push(vv2); wts.push(wv); }
                         }
                     }
-                    L('\tDeformer: ' + cid + ', "Deformer::Cluster_' + bone.name + '", "Cluster" {');
-                    L('\t\tVersion: 100');
-                    L('\t\tIndexes: *' + idxs.length + ' {'); L('\t\t\ta: ' + fmtLong(idxs)); L('\t\t}');
-                    var wstr = wts.map(fnum);
-                    L('\t\tWeights: *' + wts.length + ' {'); L('\t\t\ta: ' + fmtLong(wstr)); L('\t\t}');
-                    // Transform = ibm (mesh-local -> bone-local at bind). TransformLink = inverse(ibm) = bone world bind.
-                    var transform = ident, transformLink = ident;
+                    var transform = ident.slice(), transformLink = ident.slice();
                     if (bone.ibm) {
                         transform = Array.prototype.slice.call(bone.ibm);
                         var inv = invertMat4(bone.ibm);
                         if (inv) transformLink = Array.prototype.slice.call(inv);
                     }
-                    L('\t\tTransform: ' + transform.join(','));
-                    L('\t\tTransformLink: ' + transformLink.join(','));
-                    L('\t}');
+                    objChildren.push(N('Deformer', [L(cid), S('Deformer::Cluster_' + bone.name), S('Cluster')], [
+                        N('Version', [I(100)]),
+                        N('Indexes', [iArr(idxs, idxs.length)]),
+                        N('Weights', [dArr(wts, wts.length)]),
+                        N('Transform', [dArr(transform, 16)]),
+                        N('TransformLink', [dArr(transformLink, 16)])
+                    ]));
                 });
             }
 
             // Mesh Model node
-            L('\tModel: ' + meshModelIds[i] + ', "Model::' + g.name + '", "Mesh" {');
-            L('\t\tVersion: 232');
-            L('\t\tProperties70:  {');
-            L('\t\t\tP: "RotationActive", "bool", "", "",1');
-            L('\t\t\tP: "InheritType", "enum", "", "",1');
-            L('\t\t\tP: "Lcl Translation", "Lcl Translation", "", "A",0,0,0');
-            L('\t\t\tP: "Lcl Rotation", "Lcl Rotation", "", "A",0,0,0');
-            L('\t\t\tP: "Lcl Scaling", "Lcl Scaling", "", "A",1,1,1');
-            L('\t\t\tP: "DefaultAttribute", "int", "Integer", "",0');
-            L('\t\t}');
-            L('\t\tMultiLayer: 0');
-            L('\t\tMultiTake: 1');
-            L('\t\tShading: Y');
-            L('\t\tCulling: "CullingOff"');
-            L('\t}');
+            objChildren.push(N('Model', [L(meshModelIds[i]), S('Model::' + g.name), S('Mesh')], [
+                N('Version', [I(232)]),
+                N('Properties70', [], [
+                    Pbool('RotationActive', 1), Penum('InheritType', 1),
+                    Pvec('Lcl Translation', 0, 0, 0),
+                    Pvec('Lcl Rotation', 0, 0, 0),
+                    Pvec('Lcl Scaling', 1, 1, 1)
+                ])
+            ]));
         });
 
         // Bone Model nodes (LimbNode) with local TRS
         rigBones.forEach(function (bone, bi) {
             var e = quatToEulerXYZDeg(bone.rotation[0], bone.rotation[1], bone.rotation[2], bone.rotation[3]);
-            L('\tModel: ' + boneModelIds[bi] + ', "Model::' + bone.name + '", "LimbNode" {');
-            L('\t\tVersion: 232');
-            L('\t\tProperties70:  {');
-            L('\t\t\tP: "RotationActive", "bool", "", "",1');
-            L('\t\t\tP: "RotationOrder", "int", "Integer", "",0');
-            L('\t\t\tP: "Lcl Translation", "Lcl Translation", "", "A",' + fnum(bone.translation[0]) + ',' + fnum(bone.translation[1]) + ',' + fnum(bone.translation[2]));
-            L('\t\t\tP: "Lcl Rotation", "Lcl Rotation", "", "A",' + fnum(e[0]) + ',' + fnum(e[1]) + ',' + fnum(e[2]));
-            L('\t\t\tP: "Lcl Scaling", "Lcl Scaling", "", "A",' + fnum(bone.scale[0]) + ',' + fnum(bone.scale[1]) + ',' + fnum(bone.scale[2]));
-            L('\t\t}');
-            L('\t}');
+            objChildren.push(N('Model', [L(boneModelIds[bi]), S('Model::' + bone.name), S('LimbNode')], [
+                N('Version', [I(232)]),
+                N('Properties70', [], [
+                    Pbool('RotationActive', 1), Pint('RotationOrder', 0),
+                    Pvec('Lcl Translation', bone.translation[0], bone.translation[1], bone.translation[2]),
+                    Pvec('Lcl Rotation', e[0], e[1], e[2]),
+                    Pvec('Lcl Scaling', bone.scale[0], bone.scale[1], bone.scale[2])
+                ])
+            ]));
         });
 
         // Materials
         materials.forEach(function (m, mi) {
-            L('\tMaterial: ' + matIds[mi] + ', "Material::' + m.name + '", "" {');
-            L('\t\tVersion: 102');
-            L('\t\tShadingModel: "phong"');
-            L('\t\tMultiLayer: 0');
-            L('\t\tProperties70:  {');
-            L('\t\t\tP: "ShadingModel", "KString", "", "", "phong"');
-            L('\t\t\tP: "DiffuseColor", "Color", "", "A",1,1,1');
-            L('\t\t\tP: "SpecularColor", "Color", "", "A",0.04,0.04,0.04');
-            L('\t\t\tP: "Shininess", "double", "Number", "",8');
-            L('\t\t}');
-            L('\t}');
+            objChildren.push(N('Material', [L(matIds[mi]), S('Material::' + m.name), S('')], [
+                N('Version', [I(102)]),
+                N('ShadingModel', [S('phong')]),
+                N('MultiLayer', [I(0)]),
+                N('Properties70', [], [
+                    Pstr('ShadingModel', 'phong'),
+                    Pcolor('DiffuseColor', 1, 1, 1),
+                    Pcolor('SpecularColor', 0.04, 0.04, 0.04),
+                    Pdbl('Shininess', 8)
+                ])
+            ]));
         });
 
         // Videos (image clips)
         Object.keys(videoIds).forEach(function (cu) {
             var t = textureStore[cu]; if (!t) return;
-            L('\tVideo: ' + videoIds[cu] + ', "Video::' + t.name + '", "Clip" {');
-            L('\t\tType: "Clip"');
-            L('\t\tProperties70:  {');
-            L('\t\t\tP: "Path", "KString", "XRefUrl", "", "textures/' + t.name + '"');
-            L('\t\t}');
-            L('\t\tUseMipMap: 0');
-            L('\t\tFilename: "textures/' + t.name + '"');
-            L('\t\tRelativeFilename: "textures/' + t.name + '"');
-            L('\t}');
+            objChildren.push(N('Video', [L(videoIds[cu]), S('Video::' + t.name), S('Clip')], [
+                N('Type', [S('Clip')]),
+                N('Properties70', [], [ Pstr('Path', 'textures/' + t.name) ]),
+                N('UseMipMap', [I(0)]),
+                N('Filename', [S('textures/' + t.name)]),
+                N('RelativeFilename', [S('textures/' + t.name)])
+            ]));
         });
 
         // Textures (one per material slot)
@@ -1557,145 +1599,134 @@
             ['albedo','normal','roughness','metallic','emissive','occlusion','specular','opacity'].forEach(function (ty) {
                 var t = m.slots[ty]; if (!t) return;
                 var tid = texIdsByKey[m.name + '_' + ty]; if (!tid) return;
-                L('\tTexture: ' + tid + ', "Texture::' + t.name + '", "" {');
-                L('\t\tType: "TextureVideoClip"');
-                L('\t\tVersion: 202');
-                L('\t\tTextureName: "Texture::' + t.name + '"');
-                L('\t\tProperties70:  {');
-                L('\t\t\tP: "CurrentTextureBlendMode", "enum", "", "",0');
-                L('\t\t}');
-                L('\t\tMedia: "Video::' + t.name + '"');
-                L('\t\tFileName: "textures/' + t.name + '"');
-                L('\t\tRelativeFilename: "textures/' + t.name + '"');
-                L('\t}');
+                objChildren.push(N('Texture', [L(tid), S('Texture::' + t.name), S('')], [
+                    N('Type', [S('TextureVideoClip')]),
+                    N('Version', [I(202)]),
+                    N('TextureName', [S('Texture::' + t.name)]),
+                    N('Properties70', [], [ Penum('CurrentTextureBlendMode', 0) ]),
+                    N('Media', [S('Video::' + t.name)]),
+                    N('FileName', [S('textures/' + t.name)]),
+                    N('RelativeFilename', [S('textures/' + t.name)])
+                ]));
             });
         });
 
         // Animation stacks, layers, curve nodes, curves
         var curveNodes = [], curves = [];
         rigAnimations.forEach(function (anim, ai) {
-            L('\tAnimationStack: ' + stackIds[ai] + ', "AnimStack::' + anim.name + '" {');
-            L('\t\tProperties70:  {');
             var stopTicks = Math.round((anim.duration || 0) * 46186158000);
-            L('\t\t\tP: "LocalStop", "KTime", "Time", "",' + stopTicks);
-            L('\t\t}');
-            L('\t}');
-            L('\tAnimationLayer: ' + layerIds[ai] + ', "AnimLayer::' + anim.name + '" {');
-            L('\t\tWeight: 100'); L('\t\tMute: 0'); L('\t\tSolo: 0'); L('\t\tLock: 0');
-            L('\t\tColor:  {'); L('\t\t\ta: 0.8,0.8,0.8'); L('\t\t}');
-            L('\t}');
+            objChildren.push(N('AnimationStack', [L(stackIds[ai]), S('AnimStack::' + anim.name)], [
+                N('Properties70', [], [ Ptime('LocalStop', stopTicks) ])
+            ]));
+            objChildren.push(N('AnimationLayer', [L(layerIds[ai]), S('AnimLayer::' + anim.name)], [
+                N('Weight', [D(100)]), N('Mute', [I(0)]), N('Solo', [I(0)]), N('Lock', [I(0)])
+            ]));
             anim.channels.forEach(function (ch) {
                 var tgt = boneModelIds[ch.boneIdx]; if (!tgt) return;
                 var isRot = ch.path === 'rotation';
                 var srcStride = isRot ? 4 : 3;
                 var propName = ch.path === 'translation' ? 'Lcl Translation' : (ch.path === 'rotation' ? 'Lcl Rotation' : 'Lcl Scaling');
                 var cnId = nid();
-                L('\tAnimationCurveNode: ' + cnId + ', "AnimCurveNode::' + propName + '" {');
-                L('\t\tProperties70:  {');
-                L('\t\t\tP: "d|X", "Compound", "", "A",0');
-                L('\t\t\tP: "d|Y", "Compound", "", "A",0');
-                L('\t\t\tP: "d|Z", "Compound", "", "A",0');
-                L('\t\t}');
-                L('\t}');
+                objChildren.push(N('AnimationCurveNode', [L(cnId), S('AnimCurveNode::' + propName)], [
+                    N('Properties70', [], [ Pdbl('d|X', 0), Pdbl('d|Y', 0), Pdbl('d|Z', 0) ])
+                ]));
                 curveNodes.push({ id: cnId, layerId: layerIds[ai], modelId: tgt, propName: propName });
-                // pre-convert rotation quaternions to Euler degrees
                 var eu = null;
                 if (isRot) {
                     eu = [];
-                    for (var k = 0; k < ch.times.length; k++) {
-                        eu.push(quatToEulerXYZDeg(ch.values[k*4], ch.values[k*4+1], ch.values[k*4+2], ch.values[k*4+3]));
-                    }
+                    for (var k = 0; k < ch.times.length; k++) eu.push(quatToEulerXYZDeg(ch.values[k*4], ch.values[k*4+1], ch.values[k*4+2], ch.values[k*4+3]));
                 }
                 ['X','Y','Z'].forEach(function (comp, ci) {
                     var cvId = nid();
-                    var kt = [], kv = [], def = 0;
+                    var kt = new Array(ch.times.length), kv = new Array(ch.times.length), def = 0;
                     for (var k = 0; k < ch.times.length; k++) {
                         var tt = Math.round(ch.times[k] * 46186158000);
                         var val = isRot ? eu[k][ci] : ch.values[k*srcStride + ci];
                         if (k === 0) def = val;
-                        kt.push(tt);
-                        kv.push(fnum(val));
+                        kt[k] = tt; kv[k] = val;
                     }
-                    L('\tAnimationCurve: ' + cvId + ' {');
-                    L('\t\tDefault: ' + fnum(def));
-                    L('\t\tKeyVer: 4000');
-                    L('\t\tKeyTime: *' + kt.length + ' {'); L('\t\t\ta: ' + fmtLong(kt)); L('\t\t}');
-                    L('\t\tKeyValueFloat: *' + kv.length + ' {'); L('\t\t\ta: ' + fmtLong(kv)); L('\t\t}');
-                    L('\t}');
+                    objChildren.push(N('AnimationCurve', [L(cvId)], [
+                        N('Default', [D(def)]),
+                        N('KeyVer', [I(4000)]),
+                        N('KeyTime', [iArr(kt, kt.length)]),
+                        N('KeyValueFloat', [dArr(kv, kv.length)])
+                    ]));
                     curves.push({ id: cvId, nodeId: cnId, comp: comp });
                 });
             });
         });
 
-        L('}'); // end Objects
+        topLevel.push(N('Objects', [], objChildren));
 
         // ---- Connections ----
-        L('Connections:  {');
-        // geometry -> model, material -> model
+        var connChildren = [];
         geometries.forEach(function (g, i) {
-            L('\tC: "OO",' + meshGeoIds[i] + ',' + meshModelIds[i]);
-            if (matIds[i]) L('\tC: "OO",' + matIds[i] + ',' + meshModelIds[i]);
+            connChildren.push(N('C', [S('OO'), L(meshGeoIds[i]), L(meshModelIds[i])]));
+            if (matIds[i]) connChildren.push(N('C', [S('OO'), L(matIds[i]), L(meshModelIds[i])]));
         });
-        // texture -> material (OP), video -> texture (OO)
         var propMap = {albedo:'DiffuseColor',normal:'NormalMap',roughness:'Roughness',metallic:'Metallic',emissive:'Emissive',occlusion:'AmbientColor',specular:'SpecularColor',opacity:'TransparentColor'};
         materials.forEach(function (m, mi) {
             ['albedo','normal','roughness','metallic','emissive','occlusion','specular','opacity'].forEach(function (ty) {
                 var t = m.slots[ty]; if (!t) return;
                 var tid = texIdsByKey[m.name + '_' + ty]; if (!tid) return;
-                L('\tC: "OP",' + tid + ',' + matIds[mi] + ',"' + propMap[ty] + '"');
-                if (videoIds[t.cleanUrl]) L('\tC: "OO",' + videoIds[t.cleanUrl] + ',' + tid);
+                connChildren.push(N('C', [S('OP'), L(tid), L(matIds[mi]), S(propMap[ty])]));
+                if (videoIds[t.cleanUrl]) connChildren.push(N('C', [S('OO'), L(videoIds[t.cleanUrl]), L(tid)]));
             });
         });
-        // bone hierarchy
         rigBones.forEach(function (bone, bi) {
             if (!bone.parentRef) return;
             for (var k = 0; k < rigBones.length; k++) {
-                if (rigBones[k].ref === bone.parentRef) {
-                    L('\tC: "OO",' + boneModelIds[bi] + ',' + boneModelIds[k]);
-                    break;
-                }
+                if (rigBones[k].ref === bone.parentRef) { connChildren.push(N('C', [S('OO'), L(boneModelIds[bi]), L(boneModelIds[k])])); break; }
             }
         });
-        // skin -> geometry, cluster -> skin, cluster -> bone
         Object.keys(rigSkinByGeoIdx).forEach(function (gi) {
             var skinObj = rigSkinByGeoIdx[gi];
-            L('\tC: "OO",' + skinIds[gi] + ',' + meshGeoIds[gi]);
+            connChildren.push(N('C', [S('OO'), L(skinIds[gi]), L(meshGeoIds[gi])]));
             skinObj.joints.forEach(function (jb) {
                 var cid = clusterIds[gi + '_' + jb];
-                L('\tC: "OO",' + cid + ',' + skinIds[gi]);
-                if (boneModelIds[jb]) L('\tC: "OO",' + cid + ',' + boneModelIds[jb]);
+                connChildren.push(N('C', [S('OO'), L(cid), L(skinIds[gi])]));
+                if (boneModelIds[jb]) connChildren.push(N('C', [S('OO'), L(cid), L(boneModelIds[jb])]));
             });
         });
-        // animation: layer -> stack, curveNode -> layer, curveNode -> model property, curve -> curveNode component
         rigAnimations.forEach(function (anim, ai) {
-            L('\tC: "OO",' + layerIds[ai] + ',' + stackIds[ai]);
+            connChildren.push(N('C', [S('OO'), L(layerIds[ai]), L(stackIds[ai])]));
         });
         curveNodes.forEach(function (cn) {
-            L('\tC: "OO",' + cn.id + ',' + cn.layerId);
-            L('\tC: "OP",' + cn.id + ',' + cn.modelId + ',"' + cn.propName + '"');
+            connChildren.push(N('C', [S('OO'), L(cn.id), L(cn.layerId)]));
+            connChildren.push(N('C', [S('OP'), L(cn.id), L(cn.modelId), S(cn.propName)]));
         });
         curves.forEach(function (cv) {
-            L('\tC: "OP",' + cv.id + ',' + cv.nodeId + ',"d|' + cv.comp + '"');
+            connChildren.push(N('C', [S('OP'), L(cv.id), L(cv.nodeId), S('d|' + cv.comp)]));
         });
-        L('}'); // end Connections
+        topLevel.push(N('Connections', [], connChildren));
 
-        // ---- Takes (REQUIRED by FBX 7.x spec) ----
-        // Without this section, Maya/Blender/3ds-Max FBX importers may
-        // silently fail to import any objects — the file is considered
-        // structurally incomplete. Even with no animations, the empty
-        // Takes block must be present.
-        L('Takes:  {');
-        L('\tCurrent: ""');
-        rigAnimations.forEach(function (anim, ai) {
-            L('\tTake: "' + anim.name + '" {');
-            L('\t\tFileName: "' + anim.name + '.tak"');
-            L('\t\tLocalTime: 0,' + Math.round((anim.duration || 0) * 46186158000));
-            L('\t\tReferenceTime: 0,' + Math.round((anim.duration || 0) * 46186158000));
-            L('\t}');
+        // ---- Takes ----
+        var takesChildren = [ N('Current', [S('')]) ];
+        rigAnimations.forEach(function (anim) {
+            var stop = Math.round((anim.duration || 0) * 46186158000);
+            takesChildren.push(N('Take', [S(anim.name)], [
+                N('FileName', [S(anim.name + '.tak')]),
+                N('LocalTime', [L(0), L(stop)]),
+                N('ReferenceTime', [L(0), L(stop)])
+            ]));
         });
-        L('}');
+        topLevel.push(N('Takes', [], takesChildren));
 
-        return { ascii: out.join('\n') + '\n' };
+        // ---- serialize to binary ----
+        var buf = new BBuf();
+        // header: 23-byte magic + uint32 version
+        buf.strBytes('Kaydara FBX Binary  \x00\x1A\x00');
+        buf.u32(7400);
+        var off = buf.len;
+        for (var ti = 0; ti < topLevel.length; ti++) { serializeNode(buf, topLevel[ti], off); off += nodeSize(topLevel[ti]); }
+        // null record (terminates top-level node list)
+        buf.u32(0); buf.u32(0); buf.u32(0); buf.u8(0);
+        // footer: 16-byte magic + uint32 version
+        var fm = [0xF3,0x1C,0xA7,0xD5,0x76,0x1C,0xD5,0x47,0xB3,0x7E,0xB4,0x6E,0x8C,0x66,0x25,0xE3];
+        for (var fi = 0; fi < 16; fi++) buf.u8(fm[fi]);
+        buf.u32(7400);
+
+        return { binary: buf.toU8() };
     }
 
     // --------------------------- metadata ----------------------------
@@ -1753,9 +1784,9 @@
                         setProgress(5 + Math.round((done / total) * 60));
                         setMsg('Texture ' + done + '/' + total + ': ' + nm);
                     });
-                    setMsg('Writing FBX (Maya — rig + anim + skin)…'); setProgress(72);
+                    setMsg('Writing FBX (binary 7.4.0 — Maya/Blender/3ds-Max native)…'); setProgress(72);
                     var fbx = buildFBX(modelName);
-                    root.file(modelName + '.fbx', fbx.ascii);
+                    root.file(modelName + '.fbx', fbx.binary);
                     setProgress(85);
                     setMsg('FBX ready: ' + rigBones.length + ' bones, ' + rigAnimations.length + ' anim(s), ' + geometries.length + ' mesh(es)');
                 } else {
