@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         SketchFab Likolus Export
 // @namespace    https://github.com/Likolus
-// @version      1.4.0
+// @version      1.4.1
 // @description  Export Sketchfab models to OBJ (static) or FBX (binary 7.4.0 — Maya/Blender/3ds-Max native, rig+anim+skin) or glTF. Maya/Blender-ready: materials, textures, skeleton, skin weights, animations — nothing lost. Improved fork of SUR.
 // @author       Likolus
 // @match        https://sketchfab.com/*
@@ -305,13 +305,58 @@
             } catch (e) {}
 
             var geoIdx = geometries.length;
+            // Safely extract a typed/array index list from a Sketchfab primitive.
+            // p.indices can be: a BufferAttribute-like { _elements }, { array },
+            // the typed array itself, undefined (non-indexed geometry), etc.
+            // Also normalise the draw mode and synthesize indices for non-indexed
+            // geometry so the FBX/OBJ writers always receive a flat index list.
+            function getIndexElements(prim) {
+                var idx = null;
+                if (prim.indices) {
+                    idx = prim.indices._elements || prim.indices.array || prim.indices._array;
+                    if (!idx && (ArrayBuffer.isView(prim.indices) || Array.isArray(prim.indices))) idx = prim.indices;
+                }
+                // Non-indexed geometry: synthesize 0..N-1 from the vertex count.
+                // Sketchfab primitives sometimes carry .count or .verticesCount.
+                if (!idx || !idx.length) {
+                    var cnt = prim.count || prim.verticesCount || prim.numVertices || 0;
+                    if (cnt && attr.Vertex && attr.Vertex._elements) {
+                        var have = attr.Vertex._elements.length / 3;
+                        if (cnt > have) cnt = have;
+                        idx = new (cnt > 65535 ? Uint32Array : Uint16Array)(cnt);
+                        for (var k = 0; k < cnt; k++) idx[k] = k;
+                    }
+                }
+                return idx;
+            }
+            var primList = [];
+            prims.forEach(function (p) {
+                if (!p) return;
+                var idx = getIndexElements(p);
+                if (!idx || !idx.length) return; // skip empty primitive
+                var mode = (typeof p.mode === 'number') ? p.mode : 4;
+                // Accept triangles(4)/strip(5)/fan(6). For points(0)/lines(1/2/3)
+                // treat as triangles — Sketchfab mesh parts are virtually always
+                // triangle lists; mislabelled modes would otherwise drop polygons.
+                if (mode !== 4 && mode !== 5 && mode !== 6) mode = 4;
+                primList.push({ mode: mode, indices: idx });
+            });
+            if (!primList.length) {
+                // No usable primitives — do not register as captured so a later
+                // pass (after more data loads) can retry, and don't emit an
+                // empty mesh that would be invisible in Maya/Blender.
+                capturedGeoRefs.delete(t);
+                if (uid) capturedGeoIds.delete(uid);
+                dlog('attachbody: skipped (no usable primitives): ' + nm);
+                return;
+            }
             geometries.push({
                 name: sanitizeFileName(nm, 'part_' + geoIdx),
                 rawName: nm,
                 vertex: attr.Vertex._elements,
                 normal: attr.Normal ? attr.Normal._elements : null,
                 uv: pickTexCoord(attr),
-                primitives: prims.map(function (p) { return { mode: p.mode, indices: p.indices._elements }; }),
+                primitives: primList,
                 boundTexUrl: boundTexUrl
             });
             status('Captured geometry: ' + nm + (boundTexUrl ? ' (+texture)' : ''));
@@ -1352,9 +1397,13 @@
         // ---- expand primitive indices into a flat polygon-vertex list ----
         function expandPV(g){
             var r=[];
+            if(!g||!g.primitives||!g.primitives.length) return r;
             g.primitives.forEach(function(p){
                 var idx=p.indices, mode=p.mode;
-                if(mode===4||mode===undefined){ for(var j=0;j+2<idx.length;j+=3) r.push(idx[j],idx[j+1],idx[j+2]); }
+                if(!idx||!idx.length) return;
+                // mode already normalised in attachbody, but be defensive:
+                if(mode!==5&&mode!==6) mode=4;
+                if(mode===4){ for(var j=0;j+2<idx.length;j+=3) r.push(idx[j],idx[j+1],idx[j+2]); }
                 else if(mode===5){ for(var j=0;j+2<idx.length;j++){ var a=idx[j],b=idx[j+1],c=idx[j+2]; if(j&1){var t=b;b=c;c=t;} r.push(a,b,c); } }
                 else if(mode===6){ for(var j=1;j+1<idx.length;j++) r.push(idx[0],idx[j],idx[j+1]); }
             });
@@ -1364,9 +1413,28 @@
         var materials = buildMaterials();
         var ident = [1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1];
 
-        // ---- allocate unique IDs ----
-        var meshGeoIds = [], meshModelIds = [];
-        geometries.forEach(function () { meshGeoIds.push(nid()); meshModelIds.push(nid()); });
+        // ---- filter to geometries that actually have vertices + polygons ----
+        // A geometry with vertices but zero polygons renders NOTHING in
+        // Maya/Blender/3ds Max (silent import, empty viewport) — exactly the
+        // "model is invisible" symptom. Drop those entirely so the FBX only
+        // contains real, drawable meshes. Keep the original index mapping
+        // (sparse arrays) so rigSkinByGeoIdx still resolves correctly.
+        var validGeos = [];        // list of original geometry indices that are valid
+        var geoStats = [];         // per-valid-geometry stats for diagnostics
+        var meshGeoIds = [], meshModelIds = []; // sparse: undefined for skipped
+        geometries.forEach(function (g, i) {
+            var vcount = (g.vertex && g.vertex.length) ? (g.vertex.length / 3) | 0 : 0;
+            var pv = expandPV(g);
+            var fcount = (pv.length / 3) | 0;
+            if (vcount === 0 || fcount === 0) {
+                geoStats.push({ index: i, name: g && g.name, vertices: vcount, faces: fcount, skipped: true });
+                return;
+            }
+            validGeos.push(i);
+            meshGeoIds[i] = nid();
+            meshModelIds[i] = nid();
+            geoStats.push({ index: i, name: g.name, vertices: vcount, faces: fcount, skipped: false });
+        });
         var boneModelIds = rigBones.map(function () { return nid(); });
         var matIds = materials.map(function () { return nid(); });
         var videoIds = {}, texIdsByKey = {};
@@ -1380,14 +1448,15 @@
         });
         var skinIds = {}, clusterIds = {};
         Object.keys(rigSkinByGeoIdx).forEach(function (gi) {
+            if (!meshGeoIds[gi]) return; // geometry was skipped — drop its skin too
             skinIds[gi] = nid();
             rigSkinByGeoIdx[gi].joints.forEach(function (jb) { clusterIds[gi + '_' + jb] = nid(); });
         });
         var stackIds = [], layerIds = [];
         rigAnimations.forEach(function () { stackIds.push(nid()); layerIds.push(nid()); });
 
-        var nModel = geometries.length + rigBones.length;
-        var nGeo = geometries.length, nMat = materials.length;
+        var nModel = validGeos.length + rigBones.length;
+        var nGeo = validGeos.length, nMat = materials.length;
         var nVid = Object.keys(videoIds).length, nTex = Object.keys(texIdsByKey).length;
         var nDef = Object.keys(skinIds).length + Object.keys(clusterIds).length;
         var nStack = rigAnimations.length;
@@ -1441,8 +1510,10 @@
         // Objects
         var objChildren = [];
 
-        geometries.forEach(function (g, i) {
+        validGeos.forEach(function (gi) {
+            var g = geometries[gi], i = gi;
             var pv = expandPV(g);
+            if (!pv.length) return; // safety: skip if no polygons
             var sc = settings.scale;
             // vertices (doubles, scaled)
             var varr = new Array(g.vertex.length);
@@ -1660,7 +1731,7 @@
 
         // ---- Connections ----
         var connChildren = [];
-        geometries.forEach(function (g, i) {
+        validGeos.forEach(function (i) {
             connChildren.push(N('C', [S('OO'), L(meshGeoIds[i]), L(meshModelIds[i])]));
             if (matIds[i]) connChildren.push(N('C', [S('OO'), L(matIds[i]), L(meshModelIds[i])]));
         });
@@ -1680,6 +1751,7 @@
             }
         });
         Object.keys(rigSkinByGeoIdx).forEach(function (gi) {
+            if (!skinIds[gi]) return; // geometry was skipped — no skin connection
             var skinObj = rigSkinByGeoIdx[gi];
             connChildren.push(N('C', [S('OO'), L(skinIds[gi]), L(meshGeoIds[gi])]));
             skinObj.joints.forEach(function (jb) {
@@ -1726,7 +1798,7 @@
         for (var fi = 0; fi < 16; fi++) buf.u8(fm[fi]);
         buf.u32(7400);
 
-        return { binary: buf.toU8() };
+        return { binary: buf.toU8(), stats: geoStats, meshCount: validGeos.length };
     }
 
     // --------------------------- metadata ----------------------------
@@ -1787,8 +1859,14 @@
                     setMsg('Writing FBX (binary 7.4.0 — Maya/Blender/3ds-Max native)…'); setProgress(72);
                     var fbx = buildFBX(modelName);
                     root.file(modelName + '.fbx', fbx.binary);
+                    md.fbxStats = { meshes: fbx.meshCount, totalGeometries: geometries.length, perGeometry: fbx.stats };
                     setProgress(85);
-                    setMsg('FBX ready: ' + rigBones.length + ' bones, ' + rigAnimations.length + ' anim(s), ' + geometries.length + ' mesh(es)');
+                    if (fbx.meshCount === 0) {
+                        setMsg('WARNING: 0 valid meshes exported — model will be empty! Let the model fully load in the viewer before exporting.');
+                    } else {
+                        var skipped = geometries.length - fbx.meshCount;
+                        setMsg('FBX ready: ' + fbx.meshCount + ' mesh(es)' + (skipped ? ' (' + skipped + ' empty skipped)' : '') + ', ' + rigBones.length + ' bones, ' + rigAnimations.length + ' anim(s)');
+                    }
                 } else {
                     setMsg('Fetching textures for GLTF…'); setProgress(5);
                     await fetchAllTextures(function (done, total, nm) {
