@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         SketchFab Likolus Export
 // @namespace    https://github.com/Likolus
-// @version      1.4.4
+// @version      1.4.5
 // @description  Export Sketchfab models to OBJ (static) or FBX (binary 7.4.0 — Maya/Blender/3ds-Max native, rig+anim+skin) or glTF. Maya/Blender-ready: materials, textures, skeleton, skin weights, animations — nothing lost. Improved fork of SUR.
 // @author       Likolus
 // @match        https://sketchfab.com/*
@@ -1726,7 +1726,7 @@
             objChildren.push(N('Model', [L(boneModelIds[bi]), objName(bone.name, 'Model'), S('LimbNode')], [
                 N('Version', [I(232)]),
                 N('Properties70', [], [
-                    Pbool('RotationActive', 1), Pint('RotationOrder', 0),
+                    Pbool('RotationActive', 1), Penum('RotationOrder', 0), Penum('InheritType', 1),
                     Pvec('Lcl Translation', bone.translation[0], bone.translation[1], bone.translation[2]),
                     Pvec('Lcl Rotation', e[0], e[1], e[2]),
                     Pvec('Lcl Scaling', bone.scale[0], bone.scale[1], bone.scale[2])
@@ -1812,7 +1812,7 @@
                         if (k === 0) def = val;
                         kt[k] = tt; kv[k] = val;
                     }
-                    objChildren.push(N('AnimationCurve', [L(cvId)], [
+                    objChildren.push(N('AnimationCurve', [L(cvId), objName('', 'AnimCurve'), S('')], [
                         N('Default', [D(def)]),
                         N('KeyVer', [I(4000)]),
                         N('KeyTime', [iArr(kt, kt.length)]),
@@ -1826,10 +1826,17 @@
         topLevel.push(N('Objects', [], objChildren));
 
         // ---- Connections ----
+        // In FBX, an object only becomes part of the scene when connected to
+        // the scene root (id 0) via C: "OO", <modelId>, 0. Without this root
+        // link, Blender's importer silently skips the Model (creates nothing),
+        // while lenient viewers (3dviewer.net) auto-link orphans. This was the
+        // root cause of "FBX imports with 0 meshes" in Blender.
         var connChildren = [];
         validGeos.forEach(function (i) {
             connChildren.push(N('C', [S('OO'), L(meshGeoIds[i]), L(meshModelIds[i])]));
             if (matIds[i]) connChildren.push(N('C', [S('OO'), L(matIds[i]), L(meshModelIds[i])]));
+            // link mesh Model to scene root so Blender creates + links the object
+            connChildren.push(N('C', [S('OO'), L(meshModelIds[i]), L(0)]));
         });
         var propMap = {albedo:'DiffuseColor',normal:'NormalMap',roughness:'Roughness',metallic:'Metallic',emissive:'Emissive',occlusion:'AmbientColor',specular:'SpecularColor',opacity:'TransparentColor'};
         materials.forEach(function (m, mi) {
@@ -1841,7 +1848,11 @@
             });
         });
         rigBones.forEach(function (bone, bi) {
-            if (!bone.parentRef) return;
+            if (!bone.parentRef) {
+                // root bone: link to scene root so the armature is created
+                connChildren.push(N('C', [S('OO'), L(boneModelIds[bi]), L(0)]));
+                return;
+            }
             for (var k = 0; k < rigBones.length; k++) {
                 if (rigBones[k].ref === bone.parentRef) { connChildren.push(N('C', [S('OO'), L(boneModelIds[bi]), L(boneModelIds[k])])); break; }
             }

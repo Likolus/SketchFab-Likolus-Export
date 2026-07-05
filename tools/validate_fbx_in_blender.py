@@ -228,23 +228,52 @@ for obj in bpy.data.objects:
         })
 
 # Actions (animations)
+# Blender 4.4+ introduced slotted animation; Blender 5.1 REMOVED the legacy
+# `action.fcurves` attribute. Collect fcurves from either API.
+def collect_fcurves(action):
+    fcurves = []
+    # Legacy API (Blender <= 4.3)
+    try:
+        fcurves.extend(action.fcurves)
+        return fcurves
+    except AttributeError:
+        pass
+    # Slotted API (Blender 4.4+)
+    try:
+        for layer in action.layers:
+            for strip in layer.strips:
+                # strip.channelbags is a collection keyed by slot
+                for cb in strip.channelbags:
+                    fcurves.extend(cb.fcurves)
+    except Exception:
+        pass
+    return fcurves
+
 for action in bpy.data.actions:
     fcurves_report = []
-    for fc in action.fcurves:
-        fcurves_report.append({
-            "data_path": fc.data_path,
-            "array_index": fc.array_index,
-            "keyframe_count": len(fc.keyframe_points),
-            "extrapolation": fc.extrapolation,
-            "frame_range": [round(fc.frame_range[0], 3), round(fc.frame_range[1], 3)] if fc.keyframe_points else None,
-        })
+    all_fcurves = collect_fcurves(action)
+    for fc in all_fcurves:
+        try:
+            fcurves_report.append({
+                "data_path": fc.data_path,
+                "array_index": fc.array_index,
+                "keyframe_count": len(fc.keyframe_points),
+                "extrapolation": str(fc.extrapolation),
+                "frame_range": [round(fc.frame_range[0], 3), round(fc.frame_range[1], 3)] if fc.keyframe_points else None,
+            })
+        except Exception as fc_err:
+            fcurves_report.append({"error": str(fc_err)})
+    try:
+        fr = [round(action.frame_range[0], 3), round(action.frame_range[1], 3)]
+    except Exception:
+        fr = None
     actions_report.append({
         "name": action.name,
-        "frame_range": [round(action.frame_range[0], 3), round(action.frame_range[1], 3)],
-        "fcurve_count": len(action.fcurves),
+        "frame_range": fr,
+        "fcurve_count": len(all_fcurves),
         "fcurves": fcurves_report[:20],  # cap to first 20 for readability
         "fcurves_truncated": len(fcurves_report) > 20,
-        "total_keyframes": sum(len(fc.keyframe_points) for fc in action.fcurves),
+        "total_keyframes": sum(len(fc.keyframe_points) for fc in all_fcurves),
     })
 
 # -----------------------------------------------------------------------------
