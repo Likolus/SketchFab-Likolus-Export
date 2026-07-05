@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         SketchFab Likolus Export
 // @namespace    https://github.com/Likolus
-// @version      1.4.1
+// @version      1.4.2
 // @description  Export Sketchfab models to OBJ (static) or FBX (binary 7.4.0 — Maya/Blender/3ds-Max native, rig+anim+skin) or glTF. Maya/Blender-ready: materials, textures, skeleton, skin weights, animations — nothing lost. Improved fork of SUR.
 // @author       Likolus
 // @match        https://sketchfab.com/*
@@ -1427,7 +1427,19 @@
             var pv = expandPV(g);
             var fcount = (pv.length / 3) | 0;
             if (vcount === 0 || fcount === 0) {
-                geoStats.push({ index: i, name: g && g.name, vertices: vcount, faces: fcount, skipped: true });
+                geoStats.push({ index: i, name: g && g.name, vertices: vcount, faces: fcount, skipped: true, skipReason: vcount === 0 ? 'no vertices' : 'no faces' });
+                return;
+            }
+            // Validate indices: count triangles with ALL indices in range.
+            // If ALL triangles are out-of-range, skip this geometry entirely
+            // (so nModel/nGeo/defCount stay accurate). Per-triangle filtering
+            // of the remaining bad triangles happens later in the Objects loop.
+            var goodTriCount = 0;
+            for (var p = 0; p < pv.length; p += 3) {
+                if (pv[p] < vcount && pv[p+1] < vcount && pv[p+2] < vcount) goodTriCount++;
+            }
+            if (goodTriCount === 0) {
+                geoStats.push({ index: i, name: g.name, vertices: vcount, faces: fcount, skipped: true, skipReason: 'all indices out of range' });
                 return;
             }
             validGeos.push(i);
@@ -1515,13 +1527,46 @@
             var pv = expandPV(g);
             if (!pv.length) return; // safety: skip if no polygons
             var sc = settings.scale;
-            // vertices (doubles, scaled)
+            var vcount = (g.vertex.length / 3) | 0;
+
+            // ---- validate + sanitize vertices (NaN/Infinity breaks Maya FBX import) ----
             var varr = new Array(g.vertex.length);
-            for (var vi = 0; vi < g.vertex.length; vi++) varr[vi] = g.vertex[vi] * sc;
-            // polygon-vertex index (negate last index of each triangle)
+            var vbad = 0, vmin = [Infinity,Infinity,Infinity], vmax = [-Infinity,-Infinity,-Infinity];
+            for (var vi = 0; vi < g.vertex.length; vi += 3) {
+                var vx = g.vertex[vi] * sc, vy = g.vertex[vi+1] * sc, vz = g.vertex[vi+2] * sc;
+                if (!isFinite(vx)) { vx = 0; vbad++; }
+                if (!isFinite(vy)) { vy = 0; vbad++; }
+                if (!isFinite(vz)) { vz = 0; vbad++; }
+                varr[vi] = vx; varr[vi+1] = vy; varr[vi+2] = vz;
+                if (vx < vmin[0]) vmin[0] = vx; if (vx > vmax[0]) vmax[0] = vx;
+                if (vy < vmin[1]) vmin[1] = vy; if (vy > vmax[1]) vmax[1] = vy;
+                if (vz < vmin[2]) vmin[2] = vz; if (vz > vmax[2]) vmax[2] = vz;
+            }
+            if (vbad) geoStats[i].vertexNaN = vbad;
+
+            // ---- validate + sanitize polygon-vertex indices ----
+            // Maya silently drops a mesh if ANY index is out of range.
+            // Skip bad triangles entirely so the remaining geometry survives.
+            // (Geometry-wide validation already done in the first pass; this
+            //  filters individual bad triangles from otherwise-valid meshes.)
+            var goodPV = [];
+            for (var p = 0; p < pv.length; p += 3) {
+                if (pv[p] < vcount && pv[p+1] < vcount && pv[p+2] < vcount) {
+                    goodPV.push(pv[p], pv[p+1], pv[p+2]);
+                }
+            }
+            var droppedTris = ((pv.length - goodPV.length) / 3) | 0;
+            if (droppedTris > 0) geoStats[i].droppedFaces = droppedTris;
+            pv = goodPV;
             var pvic = pv.length;
             var pvarr = new Array(pvic);
-            for (var p = 0; p < pvic; p += 3) { pvarr[p] = pv[p]; pvarr[p+1] = pv[p+1]; pvarr[p+2] = -(pv[p+2]+1); }
+            for (var p2 = 0; p2 < pvic; p2 += 3) { pvarr[p2] = pv[p2]; pvarr[p2+1] = pv[p2+1]; pvarr[p2+2] = -(pv[p2+2]+1); }
+
+            // store bounding box in stats
+            geoStats[i].bbox = { min: vmin, max: vmax };
+
+            // Sanitize geometry name for FBX (dots/spaces can confuse strict importers)
+            var geoName = (g.name || ('part_' + i)).replace(/[.\s]/g, '_');
 
             var gKids = [ N('GeometryVersion', [I(124)]) ];
             // Vertices
@@ -1533,7 +1578,9 @@
                 var nc = pv.length * 3, narr = new Array(nc);
                 for (var pp = 0; pp < pv.length; pp++) {
                     var ni = pv[pp]*3;
-                    narr[pp*3] = g.normal[ni]||0; narr[pp*3+1] = g.normal[ni+1]||0; narr[pp*3+2] = g.normal[ni+2]||0;
+                    var nx = g.normal[ni]||0, ny = g.normal[ni+1]||0, nz = g.normal[ni+2]||0;
+                    if (!isFinite(nx)) nx = 0; if (!isFinite(ny)) ny = 0; if (!isFinite(nz)) nz = 0;
+                    narr[pp*3] = nx; narr[pp*3+1] = ny; narr[pp*3+2] = nz;
                 }
                 gKids.push(N('LayerElementNormal', [I(0)], [
                     N('Version', [I(101)]), N('Name', [S('')]),
@@ -1547,6 +1594,7 @@
                 var uc = g.uv.length, uarr = new Array(uc);
                 for (var ui = 0; ui < uc; ui += 2) {
                     var uU = g.uv[ui], vV = g.uv[ui+1];
+                    if (!isFinite(uU)) uU = 0; if (!isFinite(vV)) vV = 0;
                     if (settings.flipUV) vV = 1 - vV;
                     uarr[ui] = uU; uarr[ui+1] = vV;
                 }
@@ -1572,12 +1620,12 @@
             layCh.push(N('LayerElement', [], [N('Type', [S('LayerElementMaterial')]), N('TypedIndex', [I(0)])]));
             gKids.push(N('Layer', [I(0)], layCh));
 
-            objChildren.push(N('Geometry', [L(meshGeoIds[i]), S('Geometry::' + g.name), S('Mesh')], gKids));
+            objChildren.push(N('Geometry', [L(meshGeoIds[i]), S('Geometry::' + geoName), S('Mesh')], gKids));
 
             // Skin deformer + per-bone clusters
             if (skinIds[i]) {
                 var skinObj = rigSkinByGeoIdx[i];
-                objChildren.push(N('Deformer', [L(skinIds[i]), S('Deformer::Skin_' + g.name), S('Skin')], [
+                objChildren.push(N('Deformer', [L(skinIds[i]), S('Deformer::Skin_' + geoName), S('Skin')], [
                     N('Version', [I(101)]), N('Link_DeformAcuracy', [D(4.5)])
                 ]));
                 var vcount = g.vertex.length / 3;
@@ -1613,7 +1661,7 @@
             }
 
             // Mesh Model node
-            objChildren.push(N('Model', [L(meshModelIds[i]), S('Model::' + g.name), S('Mesh')], [
+            objChildren.push(N('Model', [L(meshModelIds[i]), S('Model::' + geoName), S('Mesh')], [
                 N('Version', [I(232)]),
                 N('Properties70', [], [
                     Pbool('RotationActive', 1), Penum('InheritType', 1),
@@ -1798,7 +1846,21 @@
         for (var fi = 0; fi < 16; fi++) buf.u8(fm[fi]);
         buf.u32(7400);
 
-        return { binary: buf.toU8(), stats: geoStats, meshCount: validGeos.length };
+        // compute overall bounding box + totals for diagnostics
+        var totalV = 0, totalF = 0, gmin = [Infinity,Infinity,Infinity], gmax = [-Infinity,-Infinity,-Infinity];
+        geoStats.forEach(function (s) {
+            if (s.skipped) return;
+            totalV += s.vertices; totalF += s.faces;
+            if (s.bbox) {
+                for (var ax = 0; ax < 3; ax++) {
+                    if (s.bbox.min[ax] < gmin[ax]) gmin[ax] = s.bbox.min[ax];
+                    if (s.bbox.max[ax] > gmax[ax]) gmax[ax] = s.bbox.max[ax];
+                }
+            }
+        });
+        var overallBbox = (totalV > 0) ? { min: gmin, max: gmax } : null;
+
+        return { binary: buf.toU8(), stats: geoStats, meshCount: validGeos.length, totalVertices: totalV, totalFaces: totalF, bbox: overallBbox };
     }
 
     // --------------------------- metadata ----------------------------
@@ -1859,13 +1921,22 @@
                     setMsg('Writing FBX (binary 7.4.0 — Maya/Blender/3ds-Max native)…'); setProgress(72);
                     var fbx = buildFBX(modelName);
                     root.file(modelName + '.fbx', fbx.binary);
-                    md.fbxStats = { meshes: fbx.meshCount, totalGeometries: geometries.length, perGeometry: fbx.stats };
+                    md.fbxStats = {
+                        meshes: fbx.meshCount,
+                        totalGeometries: geometries.length,
+                        totalVertices: fbx.totalVertices,
+                        totalFaces: fbx.totalFaces,
+                        bbox: fbx.bbox,
+                        perGeometry: fbx.stats
+                    };
                     setProgress(85);
                     if (fbx.meshCount === 0) {
                         setMsg('WARNING: 0 valid meshes exported — model will be empty! Let the model fully load in the viewer before exporting.');
                     } else {
                         var skipped = geometries.length - fbx.meshCount;
-                        setMsg('FBX ready: ' + fbx.meshCount + ' mesh(es)' + (skipped ? ' (' + skipped + ' empty skipped)' : '') + ', ' + rigBones.length + ' bones, ' + rigAnimations.length + ' anim(s)');
+                        var bb = fbx.bbox;
+                        var bbStr = bb ? (' bbox: [' + bb.min.map(function(v){return v.toFixed(1);}).join(',') + ']..[' + bb.max.map(function(v){return v.toFixed(1);}).join(',') + ']') : '';
+                        setMsg('FBX ready: ' + fbx.meshCount + ' mesh(es)' + (skipped ? ' (' + skipped + ' empty skipped)' : '') + ', ' + fbx.totalVertices + ' verts, ' + fbx.totalFaces + ' faces' + bbStr);
                     }
                 } else {
                     setMsg('Fetching textures for GLTF…'); setProgress(5);
