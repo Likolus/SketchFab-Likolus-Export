@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         SketchFab Likolus Export
 // @namespace    https://github.com/Likolus
-// @version      1.4.5
+// @version      1.4.6
 // @description  Export Sketchfab models to OBJ (static) or FBX (binary 7.4.0 — Maya/Blender/3ds-Max native, rig+anim+skin) or glTF. Maya/Blender-ready: materials, textures, skeleton, skin weights, animations — nothing lost. Improved fork of SUR.
 // @author       Likolus
 // @match        https://sketchfab.com/*
@@ -60,6 +60,123 @@
 
     var window = unsafeWindow;
     console.log('[LikolusExport] init');
+
+    // ----------------------------- diagnostic mode -----------------------------
+    // Activated by ?lkxdiag=1 in URL. When on, capture functions dump the
+    // structure of Sketchfab runtime objects (keys, types, nested _elements
+    // lengths) into window.__lkxDiag. This data is essential to discover the
+    // current private field names Sketchfab uses for skin/joints/skeleton/
+    // animations — those change over time and break rig/anim capture.
+    var LKX_DIAG = (function () {
+        try {
+            var u = window.location && window.location.search ? window.location.search : '';
+            return /[?&]lkxdiag=1\b/.test(u);
+        } catch (e) { return false; }
+    })();
+    var lkxDiagData = { rigDumps: [], animDumps: [], globalsDump: null, note: 'collected by v' + '1.4.6' };
+    if (LKX_DIAG) {
+        window.__lkxDiag = lkxDiagData;
+        console.log('[LikolusExport] DIAGNOSTIC MODE ON — ?lkxdiag=1 detected. Object dumps will be collected into window.__lkxDiag and offered as a download at export time.');
+    }
+    // Safe shallow-ish structure dump. Handles cycles via a SeenSet.
+    function lkxDump(obj, label, maxDepth, seen) {
+        maxDepth = maxDepth || 4;
+        seen = seen || new WeakSet();
+        var out = { _label: label, _type: typeof obj };
+        try {
+            if (obj === null || obj === undefined) { out._value = obj; return out; }
+            if (typeof obj !== 'object') { out._value = String(obj).slice(0, 200); return out; }
+            if (seen.has(obj)) { out._cycle = true; return out; }
+            seen.add(obj);
+            // typed arrays / arrays
+            var isArr = Array.isArray(obj) || (obj.buffer && obj.buffer instanceof ArrayBuffer) || (obj.length != null && typeof obj !== 'function');
+            if (isArr && obj.length != null) {
+                out._arrayLength = obj.length;
+                out._arrayType = obj.constructor ? obj.constructor.name : 'array';
+                // sample first few elements
+                var sample = [];
+                var n = Math.min(obj.length, 6);
+                for (var i = 0; i < n; i++) {
+                    try { sample.push(typeof obj[i] === 'number' ? obj[i] : lkxDump(obj[i], '[' + i + ']', maxDepth - 1, seen)); } catch (e) { sample.push('{' + e.message + '}'); }
+                }
+                out._sample = sample;
+                return out;
+            }
+            // regular object: dump keys
+            var keys = [];
+            try { keys = Object.keys(obj); } catch (e) { try { for (var k in obj) { if (obj.hasOwnProperty(k)) keys.push(k); } } catch (e2) {} }
+            out._keys = keys.slice(0, 200);
+            out._keyCount = keys.length;
+            out._ctor = obj.constructor ? obj.constructor.name : 'Object';
+            var props = {};
+            for (var ki = 0; ki < keys.length && ki < 200; ki++) {
+                var key = keys[ki];
+                try {
+                    var v = obj[key];
+                    var tv = typeof v;
+                    if (v === null || v === undefined) { props[key] = { t: tv, v: v }; }
+                    else if (tv === 'function') { props[key] = { t: 'function', name: v.name || '', len: v.length }; }
+                    else if (tv === 'number' || tv === 'string' || tv === 'boolean') { props[key] = { t: tv, v: v }; }
+                    else if (maxDepth > 1) {
+                        // nested object/typed-array
+                        var nested = lkxDump(v, key, maxDepth - 1, seen);
+                        // collapse: if nested is a typed-array sample, just record type+len
+                        if (nested._arrayLength != null) {
+                            props[key] = { t: 'array', at: nested._arrayType, len: nested._arrayLength, sample: nested._sample };
+                        } else {
+                            props[key] = { t: 'object', ctor: nested._ctor, keys: nested._keys, keyCount: nested._keyCount };
+                        }
+                    } else {
+                        props[key] = { t: tv, ctor: (v && v.constructor) ? v.constructor.name : '' };
+                    }
+                } catch (e) { props[key] = { err: e.message }; }
+            }
+            out._props = props;
+            return out;
+        } catch (e) {
+            out._err = e.message;
+            return out;
+        }
+    }
+    // Walk parent chain of a node and dump each level.
+    function lkxDumpParentChain(node, label, levels) {
+        levels = levels || 4;
+        var chain = [];
+        var cur = node;
+        for (var i = 0; i < levels && cur; i++) {
+            chain.push(lkxDump(cur, label + '.parent[' + i + ']', 3));
+            var parent = null;
+            try {
+                var ps = cur._parents || cur.parents || cur._parent || cur.parent;
+                if (ps && ps.length) parent = ps[0];
+                else if (ps) parent = ps;
+            } catch (e) {}
+            cur = parent;
+        }
+        return chain;
+    }
+    // Search an object's keys for anything skin/joint/skeleton/anim/bone related.
+    function lkxProbeKeys(obj, label) {
+        var hits = [];
+        if (!obj || typeof obj !== 'object') return hits;
+        var keys = [];
+        try { keys = Object.keys(obj); } catch (e) { try { for (var k in obj) keys.push(k); } catch (e2) {} }
+        var patterns = /skin|joint|skeleton|bone|armature|rig|deform|cluster|invert|bind|anim|clip|track|mixer|action|player/i;
+        for (var i = 0; i < keys.length; i++) {
+            if (patterns.test(keys[i])) {
+                var v = null; try { v = obj[keys[i]]; } catch (e) {}
+                hits.push({
+                    key: keys[i],
+                    type: typeof v,
+                    ctor: (v && v.constructor) ? v.constructor.name : '',
+                    isArray: !!(v && v.length != null && typeof v !== 'function'),
+                    length: (v && v.length != null) ? v.length : null,
+                    keys: (v && typeof v === 'object') ? (function () { try { return Object.keys(v).slice(0, 40); } catch (e) { return null; } })() : null
+                });
+            }
+        }
+        return { _label: label + ' probe hits', hits: hits };
+    }
 
     // ----------------------------- state -----------------------------
     var geometries = [];          // captured geometry groups
@@ -969,6 +1086,43 @@
     }
 
     function captureRigFromGeometry(t, geoIdx, attr) {
+        // --- DIAGNOSTIC: dump object structure to find real skin/joint/skeleton field names ---
+        if (LKX_DIAG) {
+            try {
+                var dump = {
+                    geoIdx: geoIdx,
+                    geoName: (t && (t._name || (t.stateset && t.stateset._name))) || null,
+                    t: lkxDump(t, 't (geometry)', 3),
+                    attr: lkxDump(attr, 'attr', 3),
+                    parentChain: lkxDumpParentChain(t, 't', 4),
+                    tProbe: lkxProbeKeys(t, 't'),
+                    tParentProbe: (function () {
+                        var p = null;
+                        try { var ps = t._parents || t.parents || t._parent || t.parent; if (ps && ps.length) p = ps[0]; else if (ps) p = ps; } catch (e) {}
+                        return lkxProbeKeys(p, 't.parent');
+                    })(),
+                    attrProbe: lkxProbeKeys(attr, 'attr'),
+                    skinSearch: (function () {
+                        // scan t + parent for skin-like keys, dump each candidate
+                        var cands = [];
+                        var objs = [t];
+                        try { var ps = t._parents || t.parents || t._parent || t.parent; if (ps && ps.length) objs.push(ps[0]); else if (ps) objs.push(ps); } catch (e) {}
+                        for (var oi = 0; oi < objs.length; oi++) {
+                            var o = objs[oi]; if (!o) continue;
+                            var ks = []; try { ks = Object.keys(o); } catch (e) {}
+                            for (var ki = 0; ki < ks.length; ki++) {
+                                if (/skin|skeleton|rig|armature|joint|bone/i.test(ks[ki])) {
+                                    cands.push({ on: oi === 0 ? 't' : 't.parent', key: ks[ki], dump: lkxDump(o[ks[ki]], ks[ki], 3) });
+                                }
+                            }
+                        }
+                        return cands;
+                    })()
+                };
+                lkxDiagData.rigDumps.push(dump);
+                console.log('[LikolusExport DIAG] captureRig geo #' + geoIdx + ' — dumped. rigDumps=' + lkxDiagData.rigDumps.length);
+            } catch (e) { console.error('[LikolusExport DIAG] rig dump error', e); }
+        }
         // 1) find a skin / skeleton reference on the geometry or its parents
         var skin = null;
         var probeObjs = [t];
@@ -1032,6 +1186,44 @@
     function captureAnimations() {
         if (rigCaptureTried) return;
         rigCaptureTried = true;
+        // --- DIAGNOSTIC: dump animation-related objects to find real field names ---
+        if (LKX_DIAG) {
+            try {
+                var adump = {
+                    rigSceneRootsCount: rigSceneRoots.length,
+                    rigSceneRoots: rigSceneRoots.map(function (r, i) { return lkxDump(r, 'root[' + i + ']', 3); }),
+                    rigSceneRootsProbe: rigSceneRoots.map(function (r, i) { return lkxProbeKeys(r, 'root[' + i + ']'); }),
+                    windowScene: lkxDump(window.scene, 'window.scene', 3),
+                    windowSceneProbe: lkxProbeKeys(window.scene, 'window.scene'),
+                    windowApp: lkxDump(window.app, 'window.app', 3),
+                    windowAppProbe: lkxProbeKeys(window.app, 'window.app'),
+                    animationPlayer: lkxDump(window._animationPlayer, 'window._animationPlayer', 3),
+                    animationPlayerProbe: lkxProbeKeys(window._animationPlayer, 'window._animationPlayer'),
+                    rigAnimationsCount: rigAnimations.length,
+                    rigBonesCount: rigBones.length
+                };
+                // scan window top-level keys for anim/clip/track/mixer/action/player
+                var wkeys = [];
+                try { wkeys = Object.keys(window); } catch (e) { try { for (var wk in window) { if (window.hasOwnProperty(wk)) wkeys.push(wk); } } catch (e2) {} }
+                var animGlobals = [];
+                for (var wi = 0; wi < wkeys.length; wi++) {
+                    if (/anim|clip|track|mixer|action|player|skele|bone|skin|rig/i.test(wkeys[wi])) {
+                        var wv = null; try { wv = window[wkeys[wi]]; } catch (e) {}
+                        animGlobals.push({
+                            key: wkeys[wi],
+                            type: typeof wv,
+                            ctor: (wv && wv.constructor) ? wv.constructor.name : '',
+                            isArray: !!(wv && wv.length != null && typeof wv !== 'function'),
+                            length: (wv && wv.length != null) ? wv.length : null,
+                            keys: (wv && typeof wv === 'object') ? (function () { try { return Object.keys(wv).slice(0, 40); } catch (e) { return null; } })() : null
+                        });
+                    }
+                }
+                adump.windowAnimGlobals = animGlobals;
+                lkxDiagData.animDumps.push(adump);
+                console.log('[LikolusExport DIAG] captureAnimations — dumped. animDumps=' + lkxDiagData.animDumps.length + ' animGlobals=' + animGlobals.length);
+            } catch (e) { console.error('[LikolusExport DIAG] anim dump error', e); }
+        }
         try {
             // probe window + a few known roots for animation collections
             var roots = rigSceneRoots.slice();
@@ -2033,6 +2225,26 @@
             setProgress(100);
             setMsg('Done. ' + geometries.length + ' geometries, ' + texCount + ' textures.');
             saveAs(content, fname + '.zip');
+            // --- DIAGNOSTIC: also download the collected object dumps ---
+            if (LKX_DIAG) {
+                try {
+                    lkxDiagData._summary = {
+                        version: '1.4.6',
+                        geoCount: geometries.length,
+                        rigBonesCount: rigBones.length,
+                        rigAnimationsCount: rigAnimations.length,
+                        rigSkinsCount: Object.keys(rigSkinByGeoIdx).length,
+                        rigSceneRootsCount: rigSceneRoots.length,
+                        rigDumpsCollected: lkxDiagData.rigDumps.length,
+                        animDumpsCollected: lkxDiagData.animDumps.length,
+                        timestamp: new Date().toISOString()
+                    };
+                    var diagJson = JSON.stringify(lkxDiagData, null, 2);
+                    var diagBlob = new Blob([diagJson], { type: 'application/json' });
+                    saveAs(diagBlob, fname + '_lkxdiag.json');
+                    console.log('[LikolusExport DIAG] downloaded diag JSON: ' + diagBlob.size + ' bytes, ' + lkxDiagData.rigDumps.length + ' rig dumps, ' + lkxDiagData.animDumps.length + ' anim dumps');
+                } catch (e) { console.error('[LikolusExport DIAG] diag download error', e); }
+            }
             setTimeout(function () { setProgress(null); }, 1500);
         } catch (e) {
             dlog('download error', e);
