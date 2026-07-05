@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         SketchFab Likolus Export
 // @namespace    https://github.com/Likolus
-// @version      1.3.2
+// @version      1.3.3
 // @description  Export Sketchfab models to OBJ (static) or FBX (Maya-native rig+anim+skin) or glTF. Maya/Blender-ready: materials, textures, skeleton, skin weights, animations — nothing lost. Improved fork of SUR.
 // @author       Likolus
 // @match        https://sketchfab.com/*
@@ -15,6 +15,11 @@
 // @connect      media.sketchfab.com
 // @connect      sketchfab.com
 // @connect      *
+// @homepageURL  https://github.com/Likolus/SketchFab-Likolus-Export
+// @supportURL   https://github.com/Likolus/SketchFab-Likolus-Export/issues
+// @updateURL    https://raw.githubusercontent.com/Likolus/SketchFab-Likolus-Export/main/SketchFabLikolusExport.user.js
+// @downloadURL  https://raw.githubusercontent.com/Likolus/SketchFab-Likolus-Export/main/SketchFabLikolusExport.user.js
+// @icon         https://raw.githubusercontent.com/Likolus/SketchFab-Likolus-Export/main/icon.png
 // ==/UserScript==
 
 /* =====================================================================
