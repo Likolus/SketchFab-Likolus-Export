@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         SketchFab Likolus Export
 // @namespace    https://github.com/Likolus
-// @version      1.4.6
+// @version      1.4.7
 // @description  Export Sketchfab models to OBJ (static) or FBX (binary 7.4.0 — Maya/Blender/3ds-Max native, rig+anim+skin) or glTF. Maya/Blender-ready: materials, textures, skeleton, skin weights, animations — nothing lost. Improved fork of SUR.
 // @author       Likolus
 // @match        https://sketchfab.com/*
@@ -298,7 +298,9 @@
         flipUV: false,       // flip V (1-v) for UVs — off by default
         combineObj: true,    // single model.obj with groups
         fetchOriginalTextures: true,
-        rig: false           // capture skeleton + skin weights + animations (forces FBX/glTF)
+        rig: false,          // capture skeleton + skin weights + animations (forces FBX/glTF)
+        forceZUp: false      // FBX: bake +90° X rotation so vertex data is genuinely Z-up
+                            // (default off — standard Y-up FBX header lets Blender auto-convert)
     };
 
     // --------------------------- UI ----------------------------------
@@ -332,6 +334,7 @@
                   '<span style="margin-top:2px;"><input type="checkbox" id="lkx-rig"> Rig + Anim <span style="color:#f0883e;">(FBX)</span></span>' +
                   '<span><input type="checkbox" id="lkx-flipuv"> Flip UV V</span>' +
                   '<span><input type="checkbox" id="lkx-texonly"> Textures only</span>' +
+                  '<span><input type="checkbox" id="lkx-zup"> Force Z-up <span style="color:#f0883e;">(FBX bake)</span></span>' +
                 '</label>' +
               '</div>' +
               '<div id="lkx-bar-wrap" style="height:6px;background:#21262d;border-radius:3px;overflow:hidden;margin-bottom:6px;display:none;"><div id="lkx-bar" style="height:100%;width:0%;background:linear-gradient(90deg,#1f6feb,#58a6ff);transition:width .15s;"></div></div>' +
@@ -353,6 +356,16 @@
             var sc = document.getElementById('lkx-scale'); if (sc) sc.addEventListener('change', function (e) { settings.scale = parseFloat(e.target.value) || 1.0; });
             var fu = document.getElementById('lkx-flipuv'); if (fu) fu.addEventListener('change', function (e) { settings.flipUV = e.target.checked; });
             var to = document.getElementById('lkx-texonly'); if (to) to.addEventListener('change', function (e) { settings.texturesOnly = e.target.checked; });
+            var zu = document.getElementById('lkx-zup'); if (zu) zu.addEventListener('change', function (e) {
+                settings.forceZUp = e.target.checked;
+                if (settings.forceZUp && settings.format === 'obj') {
+                    // Z-up bake only applies to FBX (OBJ has no axis declaration)
+                    settings.format = 'fbx';
+                    var ob = document.querySelector('input[name="lkx-fmt"][value="obj"]');
+                    var fb = document.querySelector('input[name="lkx-fmt"][value="fbx"]');
+                    if (ob) ob.checked = false; if (fb) fb.checked = true;
+                }
+            });
             var rg = document.getElementById('lkx-rig'); if (rg) rg.addEventListener('change', function (e) {
                 settings.rig = e.target.checked;
                 if (settings.rig) {
@@ -1492,6 +1505,40 @@
         return [roll * RAD, pitch * RAD, yaw * RAD];
     }
 
+    // ---- Z-up bake helpers (v1.4.7) ----
+    // Apply +90° X rotation: (x,y,z) -> (x,-z,y). Converts Y-up data to Z-up.
+    function rotVec3ZUp(x, y, z) { return [x, -z, y]; }
+    // Apply +90° X rotation to a quaternion (qx,qy,qz,qw).
+    // q_rot = (cos(45), sin(45), 0, 0) = (s, s, 0, 0), s = sqrt(2)/2.
+    // q_new = q_rot * q. Returns [qx, qy, qz, qw] (same order as input).
+    var ZUP_S = Math.SQRT1_2; // 1/sqrt(2) = sqrt(2)/2
+    function rotQuatZUp(qx, qy, qz, qw) {
+        // q_new = q_rot * q, q_rot = (w=s, x=s, y=0, z=0)
+        // Quaternion product formula with q1=(s,s,0,0):
+        //   w = s*qw - s*qx = s*(qw - qx)
+        //   x = s*qx + s*qw = s*(qx + qw)
+        //   y = s*qy - s*qz = s*(qy - qz)
+        //   z = s*qz + s*qy = s*(qz + qy)
+        return [ZUP_S * (qx + qw), ZUP_S * (qy - qz), ZUP_S * (qz + qy), ZUP_S * (qw - qx)];
+    }
+    // Apply M * R^T (post-multiply by R transpose = R inverse) for column-major 4x4.
+    // Used for IBM: IBM_new = IBM * R^-1. Result: model-space vertices (rotated by R)
+    // map to the same bone-space coordinates as before.
+    // R^T columns: col0=[1,0,0,0], col1=[0,0,1,0], col2=[0,-1,0,0], col3=[0,0,0,1]
+    // (M*R^T) col0 = M col0, col1 = M col2, col2 = -M col1, col3 = M col3
+    function rotMatPostRT(m) {
+        var r = new Array(16);
+        // col 0 = M col 0
+        r[0]=m[0]; r[1]=m[1]; r[2]=m[2]; r[3]=m[3];
+        // col 1 = M col 2 (m[8..11])
+        r[4]=m[8]; r[5]=m[9]; r[6]=m[10]; r[7]=m[11];
+        // col 2 = -M col 1 (m[4..7])
+        r[8]=-m[4]; r[9]=-m[5]; r[10]=-m[6]; r[11]=-m[7];
+        // col 3 = M col 3
+        r[12]=m[12]; r[13]=m[13]; r[14]=m[14]; r[15]=m[15];
+        return r;
+    }
+
     function invertMat4(m) {
         var a00=m[0],a01=m[4],a02=m[8],a03=m[12];
         var a10=m[1],a11=m[5],a12=m[9],a13=m[13];
@@ -1732,11 +1779,21 @@
         ]));
 
         // GlobalSettings
+        // Axis convention (v1.4.7 fix):
+        //   UpAxis=2 (Y-up — matches Sketchfab's actual vertex data)
+        //   FrontAxis=1 (parity even — standard Maya/Autodesk)
+        //   CoordAxis=1 (right-handed — standard Maya/Blender)
+        //   OriginalUpAxis=2 (Y-up source)
+        // When settings.forceZUp is on, we declare UpAxis=3 (Z-up FBX) AND bake the
+        // +90° X rotation into vertices/normals/bones/animations/IBM so the data
+        // is genuinely Z-up. Otherwise Blender reads Y-up FBX and auto-rotates to
+        // its Z-up viewport (correct), Maya reads Y-up and displays natively.
+        var upAxisVal = settings.forceZUp ? 3 : 2;
         topLevel.push(N('GlobalSettings', [], [
             N('Version', [I(1000)]),
             N('Properties70', [], [
-                Pint('UpAxis',1), Pint('UpAxisSign',1), Pint('FrontAxis',2), Pint('FrontAxisSign',1),
-                Pint('CoordAxis',0), Pint('CoordAxisSign',1), Pint('OriginalUpAxis',1),
+                Pint('UpAxis',upAxisVal), Pint('UpAxisSign',1), Pint('FrontAxis',1), Pint('FrontAxisSign',1),
+                Pint('CoordAxis',1), Pint('CoordAxisSign',1), Pint('OriginalUpAxis',2),
                 Pdbl('OriginalUnitScaleFactor',1), Pdbl('UnitScaleFactor',1)
             ])
         ]));
@@ -1772,15 +1829,18 @@
             // ---- validate + sanitize vertices (NaN/Infinity breaks Maya FBX import) ----
             var varr = new Array(g.vertex.length);
             var vbad = 0, vmin = [Infinity,Infinity,Infinity], vmax = [-Infinity,-Infinity,-Infinity];
+            var zup = settings.forceZUp; // cache for hot loop
             for (var vi = 0; vi < g.vertex.length; vi += 3) {
                 var vx = g.vertex[vi] * sc, vy = g.vertex[vi+1] * sc, vz = g.vertex[vi+2] * sc;
                 if (!isFinite(vx)) { vx = 0; vbad++; }
                 if (!isFinite(vy)) { vy = 0; vbad++; }
                 if (!isFinite(vz)) { vz = 0; vbad++; }
-                varr[vi] = vx; varr[vi+1] = vy; varr[vi+2] = vz;
-                if (vx < vmin[0]) vmin[0] = vx; if (vx > vmax[0]) vmax[0] = vx;
-                if (vy < vmin[1]) vmin[1] = vy; if (vy > vmax[1]) vmax[1] = vy;
-                if (vz < vmin[2]) vmin[2] = vz; if (vz > vmax[2]) vmax[2] = vz;
+                // Z-up bake: (x,y,z) -> (x,-z,y)
+                var rx = vx, ry = zup ? -vz : vy, rz = zup ? vy : vz;
+                varr[vi] = rx; varr[vi+1] = ry; varr[vi+2] = rz;
+                if (rx < vmin[0]) vmin[0] = rx; if (rx > vmax[0]) vmax[0] = rx;
+                if (ry < vmin[1]) vmin[1] = ry; if (ry > vmax[1]) vmax[1] = ry;
+                if (rz < vmin[2]) vmin[2] = rz; if (rz > vmax[2]) vmax[2] = rz;
             }
             if (vbad) geoStats[i].vertexNaN = vbad;
 
@@ -1820,7 +1880,12 @@
                     var ni = pv[pp]*3;
                     var nx = g.normal[ni]||0, ny = g.normal[ni+1]||0, nz = g.normal[ni+2]||0;
                     if (!isFinite(nx)) nx = 0; if (!isFinite(ny)) ny = 0; if (!isFinite(nz)) nz = 0;
-                    narr[pp*3] = nx; narr[pp*3+1] = ny; narr[pp*3+2] = nz;
+                    // Z-up bake: normals are directions, same rotation as positions
+                    if (settings.forceZUp) {
+                        narr[pp*3] = nx; narr[pp*3+1] = -nz; narr[pp*3+2] = ny;
+                    } else {
+                        narr[pp*3] = nx; narr[pp*3+1] = ny; narr[pp*3+2] = nz;
+                    }
                 }
                 gKids.push(N('LayerElementNormal', [I(0)], [
                     N('Version', [I(101)]), N('Name', [S('')]),
@@ -1886,8 +1951,11 @@
                     }
                     var transform = ident.slice(), transformLink = ident.slice();
                     if (bone.ibm) {
-                        transform = Array.prototype.slice.call(bone.ibm);
-                        var inv = invertMat4(bone.ibm);
+                        // Z-up bake: IBM_new = IBM * R^-1 = IBM * R^T (post-multiply by R transpose)
+                        // transformLink is computed as inverse(transform), which gives R*IBM^-1 correctly.
+                        var ibmArr = Array.prototype.slice.call(bone.ibm);
+                        transform = settings.forceZUp ? rotMatPostRT(ibmArr) : ibmArr;
+                        var inv = invertMat4(transform);
                         if (inv) transformLink = Array.prototype.slice.call(inv);
                     }
                     objChildren.push(N('Deformer', [L(cid), objName('Cluster_' + bone.name, 'Deformer'), S('Cluster')], [
@@ -1914,12 +1982,19 @@
 
         // Bone Model nodes (LimbNode) with local TRS
         rigBones.forEach(function (bone, bi) {
-            var e = quatToEulerXYZDeg(bone.rotation[0], bone.rotation[1], bone.rotation[2], bone.rotation[3]);
+            var rq = bone.rotation; // [qx, qy, qz, qw]
+            var bt = bone.translation; // [x, y, z]
+            if (settings.forceZUp) {
+                // Z-up bake: rotate translation (x,y,z)->(x,-z,y), pre-multiply rotation quat by q_rot
+                bt = rotVec3ZUp(bt[0], bt[1], bt[2]);
+                rq = rotQuatZUp(rq[0], rq[1], rq[2], rq[3]);
+            }
+            var e = quatToEulerXYZDeg(rq[0], rq[1], rq[2], rq[3]);
             objChildren.push(N('Model', [L(boneModelIds[bi]), objName(bone.name, 'Model'), S('LimbNode')], [
                 N('Version', [I(232)]),
                 N('Properties70', [], [
                     Pbool('RotationActive', 1), Penum('RotationOrder', 0), Penum('InheritType', 1),
-                    Pvec('Lcl Translation', bone.translation[0], bone.translation[1], bone.translation[2]),
+                    Pvec('Lcl Translation', bt[0], bt[1], bt[2]),
                     Pvec('Lcl Rotation', e[0], e[1], e[2]),
                     Pvec('Lcl Scaling', bone.scale[0], bone.scale[1], bone.scale[2])
                 ])
@@ -1993,14 +2068,33 @@
                 var eu = null;
                 if (isRot) {
                     eu = [];
-                    for (var k = 0; k < ch.times.length; k++) eu.push(quatToEulerXYZDeg(ch.values[k*4], ch.values[k*4+1], ch.values[k*4+2], ch.values[k*4+3]));
+                    for (var k = 0; k < ch.times.length; k++) {
+                        var qx = ch.values[k*4], qy = ch.values[k*4+1], qz = ch.values[k*4+2], qw = ch.values[k*4+3];
+                        // Z-up bake: pre-multiply rotation quat by q_rot
+                        if (settings.forceZUp) {
+                            var rq = rotQuatZUp(qx, qy, qz, qw);
+                            eu.push(quatToEulerXYZDeg(rq[0], rq[1], rq[2], rq[3]));
+                        } else {
+                            eu.push(quatToEulerXYZDeg(qx, qy, qz, qw));
+                        }
+                    }
                 }
                 ['X','Y','Z'].forEach(function (comp, ci) {
                     var cvId = nid();
                     var kt = new Array(ch.times.length), kv = new Array(ch.times.length), def = 0;
                     for (var k = 0; k < ch.times.length; k++) {
                         var tt = Math.round(ch.times[k] * 46186158000);
-                        var val = isRot ? eu[k][ci] : ch.values[k*srcStride + ci];
+                        var val;
+                        if (isRot) {
+                            val = eu[k][ci];
+                        } else if (ch.path === 'translation' && settings.forceZUp) {
+                            // Z-up bake: rotate translation keyframes (x,y,z)->(x,-z,y)
+                            var tx = ch.values[k*3], ty = ch.values[k*3+1], tz = ch.values[k*3+2];
+                            var rt = rotVec3ZUp(tx, ty, tz);
+                            val = rt[ci];
+                        } else {
+                            val = ch.values[k*srcStride + ci];
+                        }
                         if (k === 0) def = val;
                         kt[k] = tt; kv[k] = val;
                     }
