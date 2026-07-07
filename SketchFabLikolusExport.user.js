@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         SketchFab Likolus Export
 // @namespace    https://github.com/Likolus
-// @version      1.5.1
+// @version      1.5.2
 // @description  Export Sketchfab models to OBJ (static) or FBX (binary 7.4.0 - Maya/Blender/3ds-Max native, static mesh + materials + textures). Maya/Blender-ready: geometry, UVs, normals, PBR textures - nothing lost. Improved fork of SUR.
 // @author       Likolus
 // @match        https://sketchfab.com/*
@@ -22,7 +22,7 @@
 // ==/UserScript==
 
 /* =====================================================================
- *  SketchFab Likolus Export  -  v1.5.1
+ *  SketchFab Likolus Export  -  v1.5.2
  *  -------------------------------------------------------------------
  *  Goal: export a Sketchfab model exactly as it looks in the viewer,
  *  as OBJ + MTL + textures  OR  binary FBX 7.4.0, so that opening in
@@ -47,6 +47,15 @@
  *  so the viewer runs unmodified (viewport always renders); (c) use
  *  ?lkxforcepatch=1 to re-enable patching after an auto-disable.
  *
+ *  v1.5.2 CHANGE: fix "window.drawhookimg is not a function" runtime
+ *  crash. Root cause: the hooks (drawhookimg / drawhookcanvas / attachbody)
+ *  were assigned to the Tampermonkey SANDBOX window, not the real page
+ *  window, so the injected (page-context) viewer couldn't see them. The
+ *  `window = unsafeWindow` rebind silently no-ops in strict mode. Now an
+ *  explicit `pageWin` handle (=== unsafeWindow) is used for every global
+ *  the page script must reach: the three hooks, the WebGL prototype hooks
+ *  (texImage2D), lkxPatchInfo and lkxDownload.
+ *
  *  Improved fork of SUR (Sketchfab Universal Ripper).
  * ===================================================================== */
 
@@ -55,7 +64,25 @@
 
     // Tampermonkey: pull the real window so we can poke Sketchfab's
     // internals (window.scene etc.) that the sandbox hides.
-    try { if (typeof unsafeWindow !== 'undefined') window = unsafeWindow; } catch (e) {}
+    //
+    // IMPORTANT (v1.5.2): the rebind `window = unsafeWindow` silently
+    // no-ops in strict mode (window is a non-writable binding in the TM
+    // sandbox). So we keep an EXPLICIT `pageWin` handle to the real page
+    // window and use it for every global the page's own (injected, patched)
+    // viewer script must reach: drawhookimg, drawhookcanvas, attachbody,
+    // the WebGLRenderingContext.prototype texImage2D hook, lkxPatchInfo,
+    // lkxDownload. Assigning these to the sandbox `window` makes them
+    // invisible to page context -> "window.drawhookimg is not a function"
+    // at runtime inside renderInto().
+    var pageWin = window;
+    try {
+        if (typeof unsafeWindow !== 'undefined') {
+            pageWin = unsafeWindow;
+            window = unsafeWindow;   // best-effort rebind (may throw in strict mode)
+        }
+    } catch (e) {
+        try { if (typeof unsafeWindow !== 'undefined') pageWin = unsafeWindow; } catch (e2) {}
+    }
 
     // -----------------------------------------------------------------
     //  State
@@ -190,7 +217,7 @@
         ui.style.cssText = 'position:fixed;bottom:20px;right:20px;background:rgba(15,17,21,0.96);color:#e8eaed;padding:0;border-radius:10px;z-index:2147483647;font-family:-apple-system,Segoe UI,Roboto,sans-serif;font-size:12px;min-width:260px;max-width:320px;border:1px solid #1f6feb;box-shadow:0 8px 30px rgba(0,0,0,0.55);pointer-events:auto;backdrop-filter:blur(6px);';
         ui.innerHTML =
             '<div style="display:flex;justify-content:space-between;align-items:center;padding:10px 12px;border-bottom:1px solid #2a2f37;background:linear-gradient(90deg,#1f6feb,#0d3a8a);border-radius:10px 10px 0 0;">' +
-              '<span style="font-weight:700;color:#fff;letter-spacing:.3px;">SketchFab Likolus Export <span style="font-size:9px;color:#8b949e;font-weight:400;vertical-align:middle;">v1.5.1</span></span>' +
+              '<span style="font-weight:700;color:#fff;letter-spacing:.3px;">SketchFab Likolus Export <span style="font-size:9px;color:#8b949e;font-weight:400;vertical-align:middle;">v1.5.2</span></span>' +
               '<span id="lkx-close" style="cursor:pointer;color:#fff;opacity:.8;font-size:16px;line-height:1;">\u00d7</span>' +
             '</div>' +
             '<div style="padding:12px;">' +
@@ -278,7 +305,7 @@
     //  Geometry capture
     // -----------------------------------------------------------------
     // Called from injected patch: window.attachbody(t)
-    window.attachbody = function (t, glCtx) {
+    pageWin.attachbody = function (t, glCtx) {
         try {
             if (geometries.length > 1000) return;
             if (!t) return;
@@ -379,7 +406,7 @@
     //  Texture capture
     // -----------------------------------------------------------------
     // Called from injected patch: window.drawhookcanvas(e, imageModel)
-    window.drawhookcanvas = function (e, imageModel) {
+    pageWin.drawhookcanvas = function (e, imageModel) {
         try {
             if (!e) return e;
             if ((e.width === 128 && e.height === 128) || (e.width === 32 && e.height === 32) || (e.width === 64 && e.height === 64)) return e;
@@ -431,7 +458,7 @@
     // path (re-reading at export time gives broken/recycled pixels).
     // NOTE: the caller passes (t, image_data) - so `gl` here IS the caller's
     // `t` (the GL context), and `t` here IS `image_data` (t[5] = <img>).
-    window.drawhookimg = function (gl, t) {
+    pageWin.drawhookimg = function (gl, t) {
         try {
             if (!gl || !t) return;
             var imgEl = t[5];
@@ -511,18 +538,19 @@
             };
         } catch (e) { dlog('hook texImage2D error', e); }
     }
-    // hook as soon as prototypes exist
+    // Hook the REAL page WebGL prototypes (pageWin, not the sandbox
+    // window) so the page's own GL calls go through our texImage2D hook.
     function tryHookWebGL() {
-        if (window.WebGLRenderingContext) hookWebGL(window.WebGLRenderingContext.prototype);
-        if (window.WebGL2RenderingContext) hookWebGL(window.WebGL2RenderingContext.prototype);
+        if (pageWin.WebGLRenderingContext) hookWebGL(pageWin.WebGLRenderingContext.prototype);
+        if (pageWin.WebGL2RenderingContext) hookWebGL(pageWin.WebGL2RenderingContext.prototype);
     }
     tryHookWebGL();
     // also hook if prototypes appear later
     var webGLPoll = setInterval(function () {
-        if ((window.WebGLRenderingContext && !window.WebGLRenderingContext.prototype._lkxHooked) ||
-            (window.WebGL2RenderingContext && !window.WebGL2RenderingContext.prototype._lkxHooked)) {
+        if ((pageWin.WebGLRenderingContext && !pageWin.WebGLRenderingContext.prototype._lkxHooked) ||
+            (pageWin.WebGL2RenderingContext && !pageWin.WebGL2RenderingContext.prototype._lkxHooked)) {
             tryHookWebGL();
-        } else if (window.WebGLRenderingContext && window.WebGLRenderingContext.prototype._lkxHooked) {
+        } else if (pageWin.WebGLRenderingContext && pageWin.WebGLRenderingContext.prototype._lkxHooked) {
             clearInterval(webGLPoll);
         }
     }, 500);
@@ -1439,7 +1467,7 @@
             setProgress(null);
         }
     }
-    window.lkxDownload = doDownload;
+    pageWin.lkxDownload = doDownload;
 
     // =================================================================
     //  Sketchfab viewer script patching (proven injection points)
@@ -1514,7 +1542,7 @@
     // script ran successfully -> our patches are safe.
     function viewerBootstrapped() {
         try {
-            if (window.scene) return true;
+            if (pageWin.scene) return true;
             var cv = document.querySelector('canvas');
             if (cv && cv.width > 1 && cv.height > 1) {
                 var gl = cv.getContext('webgl2') || cv.getContext('webgl');
@@ -1602,7 +1630,7 @@
         // At least one patch matched and parses -> cancel original, inject patched.
         e.preventDefault(); e.stopPropagation();
         setPatchAttempts(getPatchAttempts() + 1);
-        window.lkxPatchInfo = { attempted: true, patches: patchesApplied, attempt: getPatchAttempts() };
+        pageWin.lkxPatchInfo = { attempted: true, patches: patchesApplied, attempt: getPatchAttempts() };
         console.log('[LikolusExport] injecting patched viewer (' + patchesApplied + ' patch' + (patchesApplied === 1 ? '' : 'es') + ', attempt ' + getPatchAttempts() + ')');
 
         var s = document.createElement('script');
@@ -1622,7 +1650,7 @@
             if (viewerBootstrapped()) {
                 clearInterval(watchdog);
                 setPatchAttempts(0);            // success -> reset counter
-                if (window.lkxPatchInfo) window.lkxPatchInfo.ok = true;
+                if (pageWin.lkxPatchInfo) pageWin.lkxPatchInfo.ok = true;
                 console.log('[LikolusExport] viewer bootstrapped with patches - attempt counter cleared.');
                 return;
             }

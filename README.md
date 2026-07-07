@@ -40,6 +40,12 @@ The export panel appears in the bottom-right corner of any Sketchfab model page:
 
 ## Changelog
 
+### v1.5.2
+- **Fixed `Uncaught TypeError: window.drawhookimg is not a function`** (crash inside `renderInto` → `applyTexImage2D` → `updatePacking` → `cull` → `render`). Root cause: the three capture hooks (`drawhookimg`, `drawhookcanvas`, `attachbody`) were assigned to the Tampermonkey **sandbox** `window`, not the real **page** `window`. The `window = unsafeWindow` rebind silently no-ops in strict mode (non-writable binding), so the injected (page-context) viewer script couldn't see the hooks → `TypeError` on every texture upload → broken render traversal.
+- Introduced an explicit **`pageWin`** handle (`=== unsafeWindow`) used for every global the page's own script must reach: the three hooks, the `WebGLRenderingContext.prototype` / `WebGL2RenderingContext.prototype` `texImage2D` hook (so the page's real GL calls are intercepted, not the sandbox's), `lkxPatchInfo`, and `lkxDownload`.
+- Side effect of the fix: **texture metadata capture now actually works** — previously the `texImage2D` hook was installed on the sandbox's `WebGLRenderingContext` prototype, which the page's GL context doesn't use, so `glTextureMeta` was always empty and `attachbody` could never resolve the bound texture. With `pageWin`, the hook lands on the real prototype.
+- This was a latent bug masked by v1.5.0/v1.5.1: before v1.5.1 the viewer was often NOT successfully patched (so the hooks were never called), and after v1.5.1 the self-healing patch made injection reliable — which then triggered the latent crash.
+
 ### v1.5.1
 - **Fixed the recurring "3D viewport doesn't finish loading" bug.** Root cause: Sketchfab periodically re-minifies their viewer bundle, so the regex injection points (`renderInto`, `drawArrays`, `getResourceImage`, `drawGeometry`) go stale; re-injecting a silently-corrupted viewer then killed the 3D scene on init.
 - Patching is now **non-fatal** with three guards:
