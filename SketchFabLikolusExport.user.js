@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         SketchFab Likolus Export
 // @namespace    https://github.com/Likolus
-// @version      1.5.0
+// @version      1.5.1
 // @description  Export Sketchfab models to OBJ (static) or FBX (binary 7.4.0 - Maya/Blender/3ds-Max native, static mesh + materials + textures). Maya/Blender-ready: geometry, UVs, normals, PBR textures - nothing lost. Improved fork of SUR.
 // @author       Likolus
 // @match        https://sketchfab.com/*
@@ -22,7 +22,7 @@
 // ==/UserScript==
 
 /* =====================================================================
- *  SketchFab Likolus Export  -  v1.5.0
+ *  SketchFab Likolus Export  -  v1.5.1
  *  -------------------------------------------------------------------
  *  Goal: export a Sketchfab model exactly as it looks in the viewer,
  *  as OBJ + MTL + textures  OR  binary FBX 7.4.0, so that opening in
@@ -35,6 +35,17 @@
  *  export paths remain. This dramatically simplifies the code, removes
  *  a long tail of fragile probes into Sketchfab's minified viewer, and
  *  gives rock-solid static-mesh exports (which is what most users need).
+ *
+ *  v1.5.1 CHANGE: self-healing viewer patch. The #1 recurring bug was
+ *  "the 3D viewport doesn't finish loading" - caused by Sketchfab
+ *  updating their minified viewer so our regex injection points went
+ *  stale and the re-injected (corrupted) viewer died on init. Patching
+ *  is now non-fatal: (a) only cancel the original script if >=1 regex
+ *  matched AND the patched source still parses (new Function check);
+ *  (b) per-URL sessionStorage counter - if a patched load fails to
+ *  produce a WebGL canvas within 20s, reload; next load skips patching
+ *  so the viewer runs unmodified (viewport always renders); (c) use
+ *  ?lkxforcepatch=1 to re-enable patching after an auto-disable.
  *
  *  Improved fork of SUR (Sketchfab Universal Ripper).
  * ===================================================================== */
@@ -179,7 +190,7 @@
         ui.style.cssText = 'position:fixed;bottom:20px;right:20px;background:rgba(15,17,21,0.96);color:#e8eaed;padding:0;border-radius:10px;z-index:2147483647;font-family:-apple-system,Segoe UI,Roboto,sans-serif;font-size:12px;min-width:260px;max-width:320px;border:1px solid #1f6feb;box-shadow:0 8px 30px rgba(0,0,0,0.55);pointer-events:auto;backdrop-filter:blur(6px);';
         ui.innerHTML =
             '<div style="display:flex;justify-content:space-between;align-items:center;padding:10px 12px;border-bottom:1px solid #2a2f37;background:linear-gradient(90deg,#1f6feb,#0d3a8a);border-radius:10px 10px 0 0;">' +
-              '<span style="font-weight:700;color:#fff;letter-spacing:.3px;">SketchFab Likolus Export <span style="font-size:9px;color:#8b949e;font-weight:400;vertical-align:middle;">v1.5.0</span></span>' +
+              '<span style="font-weight:700;color:#fff;letter-spacing:.3px;">SketchFab Likolus Export <span style="font-size:9px;color:#8b949e;font-weight:400;vertical-align:middle;">v1.5.1</span></span>' +
               '<span id="lkx-close" style="cursor:pointer;color:#fff;opacity:.8;font-size:16px;line-height:1;">\u00d7</span>' +
             '</div>' +
             '<div style="padding:12px;">' +
@@ -1471,58 +1482,156 @@
         if (document.documentElement) start(); else document.addEventListener('DOMContentLoaded', start);
     })();
 
+    // -----------------------------------------------------------------
+    //  Self-healing patch safety net (v1.5.1)
+    //  Sketchfab periodically re-minifies their viewer bundle. When our
+    //  regex injection points go stale, re-injecting a (silently)
+    //  corrupted viewer kills the 3D viewport - the "model never finishes
+    //  loading" problem. These guards make patching non-fatal:
+    //    (a) only cancel the original script if >=1 regex matched AND the
+    //        patched source still parses (new Function syntax check);
+    //    (b) per-URL sessionStorage counter: if a patched load fails to
+    //        produce a WebGL canvas within 20s, reload; the next load
+    //        skips patching so the viewer runs unmodified (viewport
+    //        always renders, export falls back to texImage2D metadata);
+    //    (c) ?lkxforcepatch=1 clears the counter to re-enable patching.
+    // -----------------------------------------------------------------
+    var PATCH_WATCHDOG_MS = 20000;
+    function patchAttemptsKey() {
+        try { return 'lkx_patch_attempts::' + location.pathname; } catch (e) { return 'lkx_patch_attempts'; }
+    }
+    function getPatchAttempts() {
+        try { return parseInt(sessionStorage.getItem(patchAttemptsKey()) || '0', 10) || 0; } catch (e) { return 0; }
+    }
+    function setPatchAttempts(n) {
+        try { sessionStorage.setItem(patchAttemptsKey(), String(n)); } catch (e) {}
+    }
+    // Allow the user to force patching back on after an auto-disable.
+    try { if (/[?&]lkxforcepatch=1/.test(location.search)) { sessionStorage.removeItem(patchAttemptsKey()); } } catch (e) {}
+
+    // Sketchfab creates a WebGL canvas very early in viewer init. If one
+    // exists (with a real GL context) OR window.scene is up, the viewer
+    // script ran successfully -> our patches are safe.
+    function viewerBootstrapped() {
+        try {
+            if (window.scene) return true;
+            var cv = document.querySelector('canvas');
+            if (cv && cv.width > 1 && cv.height > 1) {
+                var gl = cv.getContext('webgl2') || cv.getContext('webgl');
+                if (gl) return true;
+            }
+        } catch (e) {}
+        return false;
+    }
+
     window.onbeforescriptexecute = function (e) {
-        var nodes = Array.from(e.target.childNodes);
-        nodes.forEach(function (sc) {
-            if (!(sc instanceof HTMLScriptElement)) return;
-            if (sc.src.indexOf('web/dist/') < 0 && sc.src.indexOf('standaloneViewer') < 0) return;
-            var req = new XMLHttpRequest();
-            req.open('GET', sc.src, false);
-            try { req.send(''); } catch (err) { return; }
-            if (req.status !== 200) { console.warn('[LikolusExport] fetch viewer failed', req.status); return; }
-            e.preventDefault(); e.stopPropagation();
-            var js = req.responseText;
-            var m;
+        // Process ONLY the specific script node that was just added.
+        // (Old code re-scanned e.target.childNodes on every mutation and
+        // could re-inject the viewer multiple times -> dead viewport.)
+        var sc = e.script;
+        if (!(sc instanceof HTMLScriptElement)) return;
+        if (!sc.src) return;
+        if (sc.src.indexOf('web/dist/') < 0 && sc.src.indexOf('standaloneViewer') < 0) return;
 
-            if ((m = re_renderInto1.exec(js))) {
-                var i0 = m.index + m[0].length;
-                js = js.slice(0, i0) + ',i' + js.slice(i0);
-                console.log('[LikolusExport] patch renderInto1 ok');
-            }
-            if ((m = re_renderInto2.exec(js))) {
-                var i1 = m.index + m[0].length;
-                js = js.slice(0, i1) + ',image_data' + js.slice(i1);
-                console.log('[LikolusExport] patch renderInto2 ok');
-            }
-            if ((m = re_drawArrays.exec(js))) {
-                var i2 = m.index + m[0].length;
-                // SUR-proven: `t` is the GL context, `image_data` is the 4th param
-                // added by the renderInto2 patch. MUST use these names - `gl` is
-                // NOT in scope here (older builds used `gl`, now it's `t`).
-                js = js.slice(0, i2) + ',window.drawhookimg(t,image_data)' + js.slice(i2);
-                console.log('[LikolusExport] patch drawArrays ok');
-            }
-            if ((m = re_getResourceImage.exec(js))) {
-                var i3 = m.index + m[0].length;
-                js = js.slice(0, i3) + 'e = window.drawhookcanvas(e,this._imageModel);' + js.slice(i3);
-                console.log('[LikolusExport] patch getResourceImage ok');
-            }
-            if ((m = re_drawGeometry.exec(js))) {
-                var i4 = m.index + m[1].length;
-                // SUR-proven injection (no second arg); attachbody reads the
-                // bound texture via lastGLCtx captured by the texImage2D hook
-                js = js.slice(0, i4) + ';window.attachbody(t);' + js.slice(i4);
-                console.log('[LikolusExport] patch drawGeometry ok');
-            }
+        // (b) if a previous patched load failed on this exact model, let
+        //     Sketchfab's original viewer run unmodified this time.
+        if (getPatchAttempts() >= 1) {
+            console.log('[LikolusExport] patching skipped (previous attempt failed on this model; viewer runs unmodified). Use ?lkxforcepatch=1 to retry.');
+            return;
+        }
 
-            var s = document.createElement('script');
-            for (var i = 0; i < sc.attributes.length; i++) {
-                var a = sc.attributes[i];
-                if (a.name !== 'src' && a.name !== 'integrity') s.setAttribute(a.name, a.value);
+        var req = new XMLHttpRequest();
+        req.open('GET', sc.src, false);
+        try { req.send(''); } catch (err) { return; }
+        if (req.status !== 200 || !req.responseText || req.responseText.length < 1000) {
+            console.warn('[LikolusExport] fetch viewer failed', req.status);
+            return;
+        }
+        var js = req.responseText;
+        var patchesApplied = 0;
+        var m;
+
+        if ((m = re_renderInto1.exec(js))) {
+            var i0 = m.index + m[0].length;
+            js = js.slice(0, i0) + ',i' + js.slice(i0);
+            patchesApplied++; console.log('[LikolusExport] patch renderInto1 ok');
+        }
+        if ((m = re_renderInto2.exec(js))) {
+            var i1 = m.index + m[0].length;
+            js = js.slice(0, i1) + ',image_data' + js.slice(i1);
+            patchesApplied++; console.log('[LikolusExport] patch renderInto2 ok');
+        }
+        if ((m = re_drawArrays.exec(js))) {
+            var i2 = m.index + m[0].length;
+            // SUR-proven: `t` is the GL context, `image_data` is the 4th param
+            // added by the renderInto2 patch. MUST use these names - `gl` is
+            // NOT in scope here (older builds used `gl`, now it's `t`).
+            js = js.slice(0, i2) + ',window.drawhookimg(t,image_data)' + js.slice(i2);
+            patchesApplied++; console.log('[LikolusExport] patch drawArrays ok');
+        }
+        if ((m = re_getResourceImage.exec(js))) {
+            var i3 = m.index + m[0].length;
+            js = js.slice(0, i3) + 'e = window.drawhookcanvas(e,this._imageModel);' + js.slice(i3);
+            patchesApplied++; console.log('[LikolusExport] patch getResourceImage ok');
+        }
+        if ((m = re_drawGeometry.exec(js))) {
+            var i4 = m.index + m[1].length;
+            // SUR-proven injection (no second arg); attachbody reads the
+            // bound texture via lastGLCtx captured by the texImage2D hook
+            js = js.slice(0, i4) + ';window.attachbody(t);' + js.slice(i4);
+            patchesApplied++; console.log('[LikolusExport] patch drawGeometry ok');
+        }
+
+        // (a) if NO patch point matched, Sketchfab updated their viewer.
+        //     Re-injecting un-modified JS would still alter load timing and
+        //     risk breaking the 3D viewport, so let the ORIGINAL run untouched.
+        if (patchesApplied === 0) {
+            console.warn('[LikolusExport] no patch points matched (Sketchfab viewer updated?) - running original viewer unmodified. Export will be limited.');
+            return;
+        }
+
+        // (a) syntax guard: if our injection produced unbalanced/invalid JS,
+        //     refuse to inject and let the original run (avoids dead viewport).
+        try {
+            new Function(js);
+        } catch (syntaxErr) {
+            console.warn('[LikolusExport] patched viewer failed syntax check (' + syntaxErr.message + ') - running original unmodified.');
+            return;
+        }
+
+        // At least one patch matched and parses -> cancel original, inject patched.
+        e.preventDefault(); e.stopPropagation();
+        setPatchAttempts(getPatchAttempts() + 1);
+        window.lkxPatchInfo = { attempted: true, patches: patchesApplied, attempt: getPatchAttempts() };
+        console.log('[LikolusExport] injecting patched viewer (' + patchesApplied + ' patch' + (patchesApplied === 1 ? '' : 'es') + ', attempt ' + getPatchAttempts() + ')');
+
+        var s = document.createElement('script');
+        for (var i = 0; i < sc.attributes.length; i++) {
+            var a = sc.attributes[i];
+            if (a.name !== 'src' && a.name !== 'integrity') s.setAttribute(a.name, a.value);
+        }
+        s.text = js;
+        (document.getElementsByTagName('head')[0] || document.documentElement).appendChild(s);
+
+        // (b) watchdog: poll for PATCH_WATCHDOG_MS. If the viewer never
+        //     bootstraps (no WebGL canvas / no window.scene) our patches
+        //     broke it -> reload. The attempt counter is already bumped, so
+        //     the next load skips patching and the viewport will render.
+        var t0 = Date.now();
+        var watchdog = setInterval(function () {
+            if (viewerBootstrapped()) {
+                clearInterval(watchdog);
+                setPatchAttempts(0);            // success -> reset counter
+                if (window.lkxPatchInfo) window.lkxPatchInfo.ok = true;
+                console.log('[LikolusExport] viewer bootstrapped with patches - attempt counter cleared.');
+                return;
             }
-            s.text = js;
-            document.getElementsByTagName('head')[0].appendChild(s);
-        });
+            if (Date.now() - t0 >= PATCH_WATCHDOG_MS) {
+                clearInterval(watchdog);
+                console.warn('[LikolusExport] watchdog: viewer did not bootstrap within ' + (PATCH_WATCHDOG_MS / 1000) + 's - reloading without patch.');
+                try { location.reload(); } catch (e3) {}
+            }
+        }, 2000);
     };
 
 })();

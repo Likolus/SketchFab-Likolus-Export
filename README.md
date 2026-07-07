@@ -4,6 +4,8 @@ A Tampermonkey userscript that exports Sketchfab 3D models to **OBJ** (static) o
 
 Improved fork of SUR (Sketchfab Ultimate Ripper).
 
+> **v1.5.1 — self-healing viewer patch.** Fixes the recurring *"the 3D viewport doesn't finish loading"* bug. When Sketchfab re-minifies their viewer and our regex injection points go stale, patching now degrades gracefully instead of killing the viewport: the original viewer runs unmodified (export falls back to WebGL-metadata capture). A 20s watchdog auto-reloads once if a patched load fails, then disables patching for that model. Use `?lkxforcepatch=1` to retry patching. See changelog below.
+
 > **v1.5.0 — major simplification.** Rigging, skinning and animation support has been **removed entirely**. Only the static-mesh OBJ and FBX export paths remain. The rig/anim probing code was a long tail of fragile guesses against Sketchfab's minified viewer; dropping it gives rock-solid static exports, which is what most users actually need. (If you need rig/anim, pin v1.4.9.)
 
 ## Install
@@ -37,6 +39,15 @@ The export panel appears in the bottom-right corner of any Sketchfab model page:
 - **RESET** — restore default settings
 
 ## Changelog
+
+### v1.5.1
+- **Fixed the recurring "3D viewport doesn't finish loading" bug.** Root cause: Sketchfab periodically re-minifies their viewer bundle, so the regex injection points (`renderInto`, `drawArrays`, `getResourceImage`, `drawGeometry`) go stale; re-injecting a silently-corrupted viewer then killed the 3D scene on init.
+- Patching is now **non-fatal** with three guards:
+  1. The original viewer script is only cancelled if **≥1 regex matched AND the patched source still parses** (`new Function(js)` syntax check). If zero patches matched (viewer updated) or the patched JS has a syntax error, the **original runs unmodified** → viewport always loads.
+  2. A **20s watchdog** polls for a WebGL canvas / `window.scene` after injecting. If the viewer never bootstraps, the page reloads once; a **per-model `sessionStorage` counter** then makes the next load skip patching entirely so the model renders (export falls back to `texImage2D` metadata + readPixels + URL fetch).
+  3. `?lkxforcepatch=1` clears the counter to re-enable patching after an auto-disable.
+- **Fixed a double-injection bug**: the old `onbeforescriptexecute` re-scanned `e.target.childNodes` on every mutation and could re-inject the viewer multiple times. It now processes only the specific `e.script` node that was added.
+- `window.lkxPatchInfo` exposes `{attempted, patches, attempt, ok}` for live diagnostics.
 
 ### v1.5.0
 - **Removed** all rigging, skinning and animation code: `captureRigFromGeometry`, `captureAnimations`, `parseAnimation`, `registerBone`, `registerAncestors`, `buildGLTF`, plus all the `quatToEulerXYZDeg` / `rotQuatZUp` / `rotMatPostRT` / `invertMat4` / `decomposeMat4` / `getTRS` helpers that only existed to support skin/anim.
