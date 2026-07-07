@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         SketchFab Likolus Export
 // @namespace    https://github.com/Likolus
-// @version      1.5.2
+// @version      1.5.3
 // @description  Export Sketchfab models to OBJ (static) or FBX (binary 7.4.0 - Maya/Blender/3ds-Max native, static mesh + materials + textures). Maya/Blender-ready: geometry, UVs, normals, PBR textures - nothing lost. Improved fork of SUR.
 // @author       Likolus
 // @match        https://sketchfab.com/*
@@ -22,7 +22,7 @@
 // ==/UserScript==
 
 /* =====================================================================
- *  SketchFab Likolus Export  -  v1.5.2
+ *  SketchFab Likolus Export  -  v1.5.3
  *  -------------------------------------------------------------------
  *  Goal: export a Sketchfab model exactly as it looks in the viewer,
  *  as OBJ + MTL + textures  OR  binary FBX 7.4.0, so that opening in
@@ -55,6 +55,20 @@
  *  explicit `pageWin` handle (=== unsafeWindow) is used for every global
  *  the page script must reach: the three hooks, the WebGL prototype hooks
  *  (texImage2D), lkxPatchInfo and lkxDownload.
+ *
+ *  v1.5.3 CHANGE: fix "textures not exporting". Root cause: Sketchfab
+ *  renamed/removed `getResourceImage:function(e,t){` so the
+ *  getResourceImage regex no longer matched -> drawhookcanvas never
+ *  ran -> textureStore stayed empty -> zero textures in the export.
+ *  Fix: a STANDALONE texture-capture path that does NOT depend on the
+ *  viewer-script patches at all. The texImage2D prototype hook (already
+ *  installed on the real page WebGL prototypes in v1.5.2) now registers
+ *  every texture that has an image URL directly into textureStore. So
+ *  textures are captured even when 0 regex patches match. Also: relaxed
+ *  the viewer-fetch guard (status 200 with empty cross-origin
+ *  responseText was falsely rejected as "fetch viewer failed 200"),
+ *  bumped the bootstrap watchdog from 20s to 40s (heavy models like
+ *  Beretta M9 need longer), and added window.lkxStats for diagnostics.
  *
  *  Improved fork of SUR (Sketchfab Universal Ripper).
  * ===================================================================== */
@@ -174,6 +188,51 @@
     }
 
     // -----------------------------------------------------------------
+    //  Standalone texture registration (v1.5.3)
+    //  Called from the texImage2D prototype hook with the source image
+    //  URL + dimensions. Registers the texture in textureStore directly,
+    //  WITHOUT depending on the viewer-script getResourceImage patch
+    //  (which breaks whenever Sketchfab renames their minified methods).
+    //  This is the reliable capture path: any texture Sketchfab uploads
+    //  to a GL texture via an <img> element (texImage2D 6-arg form) is
+    //  captured here, regardless of how their viewer JS is structured.
+    // -----------------------------------------------------------------
+    function registerTextureFromURL(url, w, h) {
+        try {
+            if (!url) return;
+            // skip data: URLs, blob: URLs without origin info, and tiny
+            // system textures (1x1, 2x2, LUTs, lightmaps)
+            if (/^data:/i.test(url)) return;
+            if (w && h && (w < 8 || h < 8)) return;
+            var cleanUrl = url.split('?')[0].split('#')[0];
+            if (!cleanUrl) return;
+            if (textureStore[cleanUrl]) return;   // already registered
+
+            // derive a filename from the last URL path segment
+            var seg = cleanUrl.split('/').pop() || '';
+            var name = seg || ('texture_' + (Object.keys(textureStore).length + 1));
+            var ext = extFromUrl(url);
+            var base = name.replace(/\.(png|jpg|jpeg|webp|tga|bmp|ktx2)$/i, '');
+            var type = classifyTexture(name);
+            // append PBR type if not already hinted in the name
+            if (type !== 'albedo' || !new RegExp(type, 'i').test(base)) {
+                if (base.toLowerCase().indexOf(type) < 0) base = base + '_' + type;
+            }
+            textureStore[cleanUrl] = {
+                name: uniqueTexName(base, ext),
+                type: type,
+                url: url,
+                cleanUrl: cleanUrl,
+                ext: ext,
+                width: w || 0,
+                height: h || 0
+            };
+            capturedTextureSet.add(cleanUrl);
+            status('Captured texture (via texImage2D): ' + textureStore[cleanUrl].name);
+        } catch (e) { dlog('registerTextureFromURL error', e); }
+    }
+
+    // -----------------------------------------------------------------
     //  Settings (persisted to localStorage)
     // -----------------------------------------------------------------
     // v1.5.0: rig option removed. Only OBJ / FBX / textures-only remain.
@@ -217,7 +276,7 @@
         ui.style.cssText = 'position:fixed;bottom:20px;right:20px;background:rgba(15,17,21,0.96);color:#e8eaed;padding:0;border-radius:10px;z-index:2147483647;font-family:-apple-system,Segoe UI,Roboto,sans-serif;font-size:12px;min-width:260px;max-width:320px;border:1px solid #1f6feb;box-shadow:0 8px 30px rgba(0,0,0,0.55);pointer-events:auto;backdrop-filter:blur(6px);';
         ui.innerHTML =
             '<div style="display:flex;justify-content:space-between;align-items:center;padding:10px 12px;border-bottom:1px solid #2a2f37;background:linear-gradient(90deg,#1f6feb,#0d3a8a);border-radius:10px 10px 0 0;">' +
-              '<span style="font-weight:700;color:#fff;letter-spacing:.3px;">SketchFab Likolus Export <span style="font-size:9px;color:#8b949e;font-weight:400;vertical-align:middle;">v1.5.2</span></span>' +
+              '<span style="font-weight:700;color:#fff;letter-spacing:.3px;">SketchFab Likolus Export <span style="font-size:9px;color:#8b949e;font-weight:400;vertical-align:middle;">v1.5.3</span></span>' +
               '<span id="lkx-close" style="cursor:pointer;color:#fff;opacity:.8;font-size:16px;line-height:1;">\u00d7</span>' +
             '</div>' +
             '<div style="padding:12px;">' +
@@ -532,6 +591,11 @@
                         } else if (src) {
                             var ex = glTextureMeta.get(tex); if (!ex.url) { ex.url = src; ex.cleanUrl = src.split('?')[0]; }
                         }
+                        // v1.5.3: STANDALONE texture capture. Register the
+                        // texture in textureStore directly from its image URL,
+                        // without depending on the getResourceImage viewer
+                        // patch (which breaks when Sketchfab renames methods).
+                        if (src) registerTextureFromURL(src, w, h);
                     }
                 } catch (e) {}
                 return origTexImage.apply(this, arguments);
@@ -1469,6 +1533,19 @@
     }
     pageWin.lkxDownload = doDownload;
 
+    // v1.5.3: live diagnostics handle. Inspect from the console:
+    //   window.lkxStats()
+    // returns { geometries, textures, glTextures, patchInfo }.
+    pageWin.lkxStats = function () {
+        return {
+            geometries: geometries.length,
+            textures: Object.keys(textureStore).length,
+            glTextures: glTextureMeta.size,
+            patchInfo: pageWin.lkxPatchInfo || null,
+            settings: settings
+        };
+    };
+
     // =================================================================
     //  Sketchfab viewer script patching (proven injection points)
     //  Same approach as SUR - intercept the viewer JS before it runs,
@@ -1524,7 +1601,7 @@
     //        always renders, export falls back to texImage2D metadata);
     //    (c) ?lkxforcepatch=1 clears the counter to re-enable patching.
     // -----------------------------------------------------------------
-    var PATCH_WATCHDOG_MS = 20000;
+    var PATCH_WATCHDOG_MS = 40000;
     function patchAttemptsKey() {
         try { return 'lkx_patch_attempts::' + location.pathname; } catch (e) { return 'lkx_patch_attempts'; }
     }
@@ -1571,11 +1648,17 @@
         var req = new XMLHttpRequest();
         req.open('GET', sc.src, false);
         try { req.send(''); } catch (err) { return; }
-        if (req.status !== 200 || !req.responseText || req.responseText.length < 1000) {
+        if (req.status !== 200) {
             console.warn('[LikolusExport] fetch viewer failed', req.status);
             return;
         }
-        var js = req.responseText;
+        // Note: we deliberately do NOT check req.responseText here. For a
+        // cross-origin viewer script the browser may report status 200 but
+        // expose an empty responseText (CORS). If the script is same-origin
+        // (Sketchfab serves it with ACAO:*) responseText is populated and
+        // the regex patches below will run; if it's empty the patches just
+        // won't match and the original runs unmodified - safe either way.
+        var js = req.responseText || '';
         var patchesApplied = 0;
         var m;
 
